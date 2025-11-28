@@ -80,32 +80,32 @@ class PointDif(BaseModel):
         self.momentum = 0.1
         self.model_pre = None
 
-        # self.rel_encoder_3d = PointNetfeat(
-        #     global_feat=True,
-        #     batch_norm=with_bn,
-        #     point_size=11,
-        #     input_transform=False,
-        #     feature_transform=mconfig.feature_transform,
-        #     out_size=512)
+        self.rel_encoder_3d = PointNetfeat(
+            global_feat=True,
+            batch_norm=with_bn,
+            point_size=11,
+            input_transform=False,
+            feature_transform=mconfig.feature_transform,
+            out_size=512)
 
-        # self.mmg = MMG(
-        #     dim_node=512,
-        #     dim_edge=512,
-        #     dim_atten=256, #self.mconfig.DIM_ATTEN
-        #     depth=2, #self.mconfig.N_LAYERS
-        #     num_heads=8, #self.mconfig.NUM_HEADS
-        #     aggr="max", #self.mconfig.GCN_AGGR
-        #     flow=self.flow,
-        #     attention="fat",#self.mconfig.ATTENTION
-        #     use_edge=True,#self.mconfig.USE_GCN_EDGE
-        #     DROP_OUT_ATTEN=0.5)#self.mconfig.DROP_OUT_ATTEN
+        self.mmg = MMG(
+            dim_node=512,
+            dim_edge=512,
+            dim_atten=256, #self.mconfig.DIM_ATTEN
+            depth=2, #self.mconfig.N_LAYERS
+            num_heads=8, #self.mconfig.NUM_HEADS
+            aggr="max", #self.mconfig.GCN_AGGR
+            flow=self.flow,
+            attention="fat",#self.mconfig.ATTENTION
+            use_edge=True,#self.mconfig.USE_GCN_EDGE
+            DROP_OUT_ATTEN=0.5)#self.mconfig.DROP_OUT_ATTEN
 
-        # self.mlp_3d = torch.nn.Sequential(
-        #     torch.nn.Linear(512, 512 - 11),
-        #     torch.nn.LayerNorm(512 - 11),
-        #     torch.nn.ReLU(),
-        #     torch.nn.Dropout(0.1)
-        # )
+        self.mlp_3d = torch.nn.Sequential(
+            torch.nn.Linear(512, 512 - 11),
+            torch.nn.LayerNorm(512 - 11),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.1)
+        )
         
         self.config = config.maskTrans
         self.group_size = self.config.group_size
@@ -148,72 +148,72 @@ class PointDif(BaseModel):
         
         point_agg_features = self.ca_net(encoder_token)
         
-        # anchor_set = 1
+        anchor_set = 1
         
-        # if anchor_set:
-        #     device = point_agg_features.device
+        if anchor_set:
+            device = point_agg_features.device
 
-        #     # 2. 将本地锚点索引列表 (Python list) 转换为 Tensor
-        #     #    例如: anchor_id = [1, 0, 2] (B=3, 第0个图的锚点是idx 1, ...)
-        #     local_anchor_ids_tensor = torch.tensor(anchor_id, device=device, dtype=torch.long)
+            # 2. 将本地锚点索引列表 (Python list) 转换为 Tensor
+            #    例如: anchor_id = [1, 0, 2] (B=3, 第0个图的锚点是idx 1, ...)
+            local_anchor_ids_tensor = torch.tensor(anchor_id, device=device, dtype=torch.long)
 
-        #     # 3. 计算每个图的节点数
-        #     #    batch_ids (N_total, 1) -> (N_total)
-        #     batch_ids_squeezed = batch_ids.squeeze()
-        #     #    bincount 会统计 [0, 0, 0, 1, 1, 2, 2, 2] -> [3, 2, 3]
-        #     #    (即: 图0有3个节点, 图1有2个节点, 图2有3个节点)
-        #     counts = torch.bincount(batch_ids_squeezed)
+            # 3. 计算每个图的节点数
+            #    batch_ids (N_total, 1) -> (N_total)
+            batch_ids_squeezed = batch_ids.squeeze()
+            #    bincount 会统计 [0, 0, 0, 1, 1, 2, 2, 2] -> [3, 2, 3]
+            #    (即: 图0有3个节点, 图1有2个节点, 图2有3个节点)
+            counts = torch.bincount(batch_ids_squeezed)
 
-        #     # 4. 计算每个图的起始偏移量 (offsets)
-        #     #    counts [3, 2, 3] -> cumsum [3, 5, 8] -> shifted [0, 3, 5]
-        #     #    (即: 图0从idx 0开始, 图1从idx 3开始, 图2从idx 5开始)
-        #     offsets = torch.cat([torch.tensor([0], device=device), torch.cumsum(counts, dim=0)[:-1]])
+            # 4. 计算每个图的起始偏移量 (offsets)
+            #    counts [3, 2, 3] -> cumsum [3, 5, 8] -> shifted [0, 3, 5]
+            #    (即: 图0从idx 0开始, 图1从idx 3开始, 图2从idx 5开始)
+            offsets = torch.cat([torch.tensor([0], device=device), torch.cumsum(counts, dim=0)[:-1]])
 
-        #     # 5. 计算锚点的 *全局* 索引
-        #     #    offsets [0, 3, 5] + local_ids [1, 0, 2] = global_ids [1, 3, 7]
-        #     global_anchor_indices = offsets + local_anchor_ids_tensor
+            # 5. 计算锚点的 *全局* 索引
+            #    offsets [0, 3, 5] + local_ids [1, 0, 2] = global_ids [1, 3, 7]
+            global_anchor_indices = offsets + local_anchor_ids_tensor
             
-        #     # 6. 使用 *全局* 索引来提取和注入锚点特征
-        #     #    (旧代码: anchor_obj = point_agg_features[anchor_id:anchor_id+1])
-        #     anchor_obj_features = point_agg_features[global_anchor_indices]
-        #     anchor_obj_features = self.mlp_3d(anchor_obj_features)
+            # 6. 使用 *全局* 索引来提取和注入锚点特征
+            #    (旧代码: anchor_obj = point_agg_features[anchor_id:anchor_id+1])
+            anchor_obj_features = point_agg_features[global_anchor_indices]
+            anchor_obj_features = self.mlp_3d(anchor_obj_features)
             
-        #     if self.mconfig.USE_SPATIAL:
-        #         tmp = descriptor.clone()
-        #         tmp[:,6:] = tmp[:,6:].log() # only log on volume and length
+            if self.mconfig.USE_SPATIAL:
+                tmp = descriptor.clone()
+                tmp[:,6:] = tmp[:,6:].log() # only log on volume and length
 
-        #         # (旧代码: tmp[anchor_id:anchor_id+1])
-        #         anchor_spatial_info = tmp[global_anchor_indices]
+                # (旧代码: tmp[anchor_id:anchor_id+1])
+                anchor_spatial_info = tmp[global_anchor_indices]
                 
-        #         # (旧代码: abs_obj = torch.cat([anchor_obj, ...]))
-        #         abs_obj_features = torch.cat([anchor_obj_features, anchor_spatial_info], dim=-1)
+                # (旧代码: abs_obj = torch.cat([anchor_obj, ...]))
+                abs_obj_features = torch.cat([anchor_obj_features, anchor_spatial_info], dim=-1)
                 
-        #         # (旧代码: point_agg_features[anchor_id:anchor_id+1] = abs_obj.squeeze(0))
-        #         point_agg_features[global_anchor_indices] = abs_obj_features
+                # (旧代码: point_agg_features[anchor_id:anchor_id+1] = abs_obj.squeeze(0))
+                point_agg_features[global_anchor_indices] = abs_obj_features
             
-        #     # --- [!!! 锚点逻辑修改结束 !!!] ---
+            # --- [!!! 锚点逻辑修改结束 !!!] ---
         
-        # else:
-        #     point_agg_features = self.mlp_3d(point_agg_features)
-        #     if self.mconfig.USE_SPATIAL:
-        #         tmp = descriptor.clone()
-        #         tmp[:,6:] = tmp[:,6:].log() # only log on volume and length
+        else:
+            point_agg_features = self.mlp_3d(point_agg_features)
+            if self.mconfig.USE_SPATIAL:
+                tmp = descriptor.clone()
+                tmp[:,6:] = tmp[:,6:].log() # only log on volume and length
                 
-        #         point_agg_features = torch.cat([point_agg_features, tmp], dim=-1)
+                point_agg_features = torch.cat([point_agg_features, tmp], dim=-1)
         
-        # ##### 
-        # # Predicate features Extractors
-        # # ###
-        # with torch.no_grad():
-        #     edge_feature = op_utils.Gen_edge_descriptor()(descriptor, edge_indices)
-        # rel_feature_3d = self.rel_encoder_3d(edge_feature)
+        ##### 
+        # Predicate features Extractors
+        # ###
+        with torch.no_grad():
+            edge_feature = op_utils.Gen_edge_descriptor()(descriptor, edge_indices)
+        rel_feature_3d = self.rel_encoder_3d(edge_feature)
 
-        # obj_center = descriptor[:, :3].clone()
+        obj_center = descriptor[:, :3].clone()
         
-        # gcn_obj_feature_3d, gcn_edge_feature_3d \
-        #     = self.mmg(point_agg_features, rel_feature_3d, edge_indices, batch_ids, global_anchor_indices, obj_center, istrain=istrain)
+        gcn_obj_feature_3d, gcn_edge_feature_3d \
+            = self.mmg(point_agg_features, rel_feature_3d, edge_indices, batch_ids, global_anchor_indices, obj_center, istrain=istrain)
 
-        # point_agg_features_spatial = gcn_obj_feature_3d
+        point_agg_features_spatial = gcn_obj_feature_3d
         
         # cluster_and_visualize(gcn_obj_feature_3d, 20, title_prefix="Object Features",\
         #                       save_path="/home/honsen/honsen/SceneGraph/SG_pretrain_diff/clustering_dir/object_features_cluster.png")
@@ -225,7 +225,8 @@ class PointDif(BaseModel):
             
             # visualize_batch_with_weights(pts, weights, save_path=f'/home/honsen/honsen/SceneGraph/SG_pretrain_diff/src/dataset/batch_weights_{self.count}.png')
             
-            diff_loss, total_metric = self.point_diffusion.get_loss(pts, point_agg_features,weights=weights)
+            diff_loss, total_metric = self.point_diffusion.get_loss(obj_points_spatial, point_agg_features_spatial, weights=weights)
+           
             # gt_bboxes = compute_aabb_ground_truth(obj_points_spatial)
             # pred_bboxes = self.bboxes_head(gcn_obj_feature_3d)
             # bboxes_loss = self.bbox_loss_fn(pred_bboxes, gt_bboxes)
