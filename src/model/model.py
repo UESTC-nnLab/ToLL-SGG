@@ -8,6 +8,48 @@ from src.dataset.DataLoader import (CustomDataLoader, collate_fn_mmg_diff)
 from src.dataset.dataset_builder import build_dataset
 from src.model.diff_trans.models.PointDif import PointDif
 from src.model.optimizer.scheduler import get_warmup_cosine_scheduler, get_freeze_warmup_scheduler
+from src.model.diff_trans.models.monitor import EpochCollapseMonitor
+from src.model.diff_trans.models.clustering import cluster_and_visualize
+def get_param_groups(module, base_lr, weight_decay, amsgrad):
+    """
+    自动将模块内的参数分为两组：
+    1. decay_group: 权重 (Weights) -> 使用 weight_decay
+    2. no_decay_group: 偏置 (Bias) 和 Norm层参数 -> weight_decay = 0.0
+    """
+    decay_params = []
+    no_decay_params = []
+    
+    # 遍历模块内所有参数
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        # 判断是否应该取消 decay
+        # 1. 是一维向量 (通常是 Bias 或 Norm 的 scale/shift)
+        # 2. 名字里包含 bias
+        # 3. 名字里包含 norm (如 LayerNorm, BatchNorm)
+        if param.ndim <= 1 or "bias" in name or "norm" in name or "bn" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+            
+    groups = []
+    if len(decay_params) > 0:
+        groups.append({
+            'params': decay_params, 
+            'lr': base_lr, 
+            'weight_decay': weight_decay, 
+            'amsgrad': amsgrad
+        })
+    if len(no_decay_params) > 0:
+        groups.append({
+            'params': no_decay_params, 
+            'lr': base_lr, 
+            'weight_decay': 0.0,  # 关键：这里强制为 0
+            'amsgrad': amsgrad
+        })
+    
+    return groups
 
 class Pdiff4SSG_Pretraining():
     def __init__(self, config):
@@ -20,30 +62,54 @@ class Pdiff4SSG_Pretraining():
         self.total = self.config.total = len(self.dataset_train) // self.config.Batch_Size
         self.max_iteration = self.config.max_iteration = int(float(self.config.MAX_EPOCHES)*len(self.dataset_train) // self.config.Batch_Size)
         self.max_iteration_scheduler = self.config.max_iteration_scheduler = int(float(self.config.MAX_EPOCHES)*len(self.dataset_train) // self.config.Batch_Size)
-
+        
+        self.swav_monitor = EpochCollapseMonitor(60)
+        
         ''' Build Model '''
         self.model = PointDif(self.config).cuda()
         
-        # mmg_obj, mmg_rel = [], []
-        # for name, para in self.model.mmg.named_parameters():
-        #     if 'nn_edge' in name:
-        #         mmg_rel.append(para)
-        #     else:
-        #         mmg_obj.append(para)
+        # --- 构建最终的 param_groups ---
+        param_groups = []
+
+        # 1. 常规模块 (自动拆分 decay/no_decay)
+        # 注意：你需要为每个模块调用一次这个函数
+        param_groups.extend(get_param_groups(self.model.mask_encoder, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
+        param_groups.extend(get_param_groups(self.model.rel_encoder_3d, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
+        param_groups.extend(get_param_groups(self.model.ca_net, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
+        param_groups.extend(get_param_groups(self.model.mlp_3d, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
+        param_groups.extend(get_param_groups(self.model.point_diffusion.net, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
+
+        # 2. 特殊模块: SwAV Prototypes (完全不 decay)
+        param_groups.append({
+            'params': self.model.swav_reg_rel.parameters(), 
+            'lr': float(config.LR), 
+            'weight_decay': 0.0, # 规范写法
+            'amsgrad': self.config.AMSGRAD
+        })
         
-        self.optimizer = optim.AdamW([
-            {'params':self.model.mask_encoder.parameters(), 'lr':float(config.LR)/10, 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-            # {'params':self.model.rel_encoder_3d.parameters() , 'lr':float(config.LR), 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-            # {'params':self.model.mmg.parameters(), 'lr':float(config.LR)/2, 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-            {'params':self.model.mask_token, 'lr':float(config.LR), 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-            {'params':self.model.ca_net.parameters(), 'lr':float(config.LR), 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-            # {'params':self.model.mlp_3d.parameters(), 'lr':float(config.LR), 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-            # {'params':self.model.bboxes_head.parameters(), 'lr':float(config.LR), 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-            {'params':self.model.point_diffusion.net.parameters(), 'lr':float(config.LR), 'weight_decay':self.config.W_DECAY, 'amsgrad':self.config.AMSGRAD},
-        ])
+        param_groups.append({
+            'params': self.model.swav_reg_obj.parameters(), 
+            'lr': float(config.LR), 
+            'weight_decay': 0.0, # 规范写法
+            'amsgrad': self.config.AMSGRAD
+        })
+
+        # 3. 特殊模块: MMG (学习率减半)
+        param_groups.extend(get_param_groups(self.model.mmg, float(config.LR)/2, self.config.W_DECAY, self.config.AMSGRAD))
+
+        # 4. 特殊参数: Mask Token
+        # Token 通常被视为 Weight，需要 decay
+        param_groups.append({
+            'params': self.model.mask_token, 
+            'lr': float(config.LR), 
+            'weight_decay': self.config.W_DECAY, 
+            'amsgrad': self.config.AMSGRAD
+        })
+
+        # 初始化优化器
+        self.optimizer = optim.AdamW(param_groups)
         
-        #96000
-        self.lr_scheduler = get_freeze_warmup_scheduler(self.optimizer, self.total*10, self.config.max_iteration)
+        self.lr_scheduler = get_warmup_cosine_scheduler(self.optimizer, self.total*10, self.config.max_iteration)
         self.optimizer.zero_grad()
     
     def load_pretrained_mask_encoder(self, checkpoint_path):
@@ -92,12 +158,12 @@ class Pdiff4SSG_Pretraining():
         return self.model.load(best)
     @torch.no_grad()
     def data_processing_train_pdiff(self, items):
-        obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial = items
+        obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial, cur_obj_texts = items
         obj_points = obj_points.permute(0, 2, 1).contiguous()
         obj_points, edge_indices, descriptor, batch_ids, obj_points_spatial = \
             self.cuda(obj_points, edge_indices, descriptor, batch_ids, obj_points_spatial)
 
-        return obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial
+        return obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial, cur_obj_texts
           
     def train(self):
         ''' create data loader '''
@@ -148,7 +214,7 @@ class Pdiff4SSG_Pretraining():
         else:
             if resume_path:
                 print(f"Warning: RESUME_PATH '{resume_path}' was specified but file not found. Starting from scratch.")
-                self.load_pretrained_mask_encoder("/home/honsen/tartan/ckpt-epoch-300.pth")
+                # self.load_pretrained_mask_encoder("/home/honsen/tartan/ckpt-epoch-300.pth")
             else:
                 print("No RESUME_PATH specified. Starting training from scratch (epoch 0).")
                 
@@ -172,23 +238,50 @@ class Pdiff4SSG_Pretraining():
         self.model.train()
 
         while(keep_training):
-
+            
+            self.swav_monitor.reset()
+            
             if self.model.epoch > self.config.MAX_EPOCHES:#
                 break
 
-            print('\n\nTraining epoch: %d' % self.model.epoch)
-                    
-            for batch_idx, items in enumerate(loader):
+            # --- [修改 1] 使用 tqdm 包装 loader ---
+            # dynamic_ncols=True 可以让进度条自动适应终端宽度
+            pbar = tqdm(loader, total=self.total, desc=f'Epoch {self.model.epoch}', dynamic_ncols=True)
+
+            for batch_idx, items in enumerate(pbar):
                 ''' get data '''
-                print("------training------")
-                obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial = self.data_processing_train_pdiff(items)
+                # print("------training------") # --- [修改 2] 必须注释掉，否则会打断进度条 ---
+                
+                obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial, cur_obj_texts = self.data_processing_train_pdiff(items)
                 
                 ''' forward '''
-                total_loss, total_metric = self.model(obj_points.permute(0,2,1).contiguous(), edge_indices, obj_points_spatial, descriptor=descriptor, batch_ids=batch_ids, anchor_id=anchor_ids, istrain=True)
+                total_loss, diff_loss, cls_loss, cls_loss_obj, total_metric, gcn_edge_feature_3d = self.model(
+                    obj_points.permute(0,2,1).contiguous(), edge_indices, obj_points_spatial, 
+                    descriptor=descriptor, batch_ids=batch_ids, anchor_id=anchor_ids, 
+                    istrain=True, cur_obj_texts=cur_obj_texts
+                )
+                
+                with torch.no_grad():
+                    z1,q1 = self.model.swav_reg_rel.forward1(gcn_edge_feature_3d)
+        
+                # 3. 更新统计 (每个 Batch)
+                # 只需要把其中一个 view (z1, q1) 传进去即可代表本 Batch 情况
+                self.swav_monitor.update(embeddings=z1, swav_q=q1)
+                
                 current_lr = self.optimizer.param_groups[1]['lr']
-                # print('Epoch: %d, Iteration: %d / %d, diff_spatial_loss: %.4f, diff_loss: %.4f, total_spatial_metric: %.4f, total_metric: %.4f' % (self.model.epoch, batch_idx+1, self.total, diff_spatial_loss.item(), diff_loss.item(), total_spatial_metric, total_metric))
-                print('Epoch: %d, Iteration: %d / %d, diff_loss: %.4f, total_metric: %.4f, LR: %.6f'\
-                      % (self.model.epoch, batch_idx+1, self.total, total_loss.item(), total_metric, current_lr))
+
+                # --- [修改 3] 使用 set_postfix 在同一行刷新显示关键指标 ---
+                # 为了美观，保留小数位
+                pbar.set_postfix({
+                    # 'Epoch': self.model.epoch,                  # 显示当前 Epoch
+                    # 'Iter': f'{batch_idx + 1}/{self.total}',    # 显示 Iteration: 当前/总数
+                    'diff': f'{diff_loss.item():.4f}',
+                    'cls': f'{cls_loss.item():.4f}',
+                    'ctrs': f'{cls_loss_obj.item():.4f}',
+                    'met': f'{total_metric:.4f}',
+                    'lr': f'{current_lr:.6f}'
+                })
+                
                 self.backward(total_loss)
             
             if self.model.epoch % 10 == 0:
@@ -212,18 +305,18 @@ class Pdiff4SSG_Pretraining():
                 else:
                     print(f'\n[Epoch {self.model.epoch}] 警告: 未定义 self.save_dir, 跳过保存。')
             
+            self.swav_monitor.report(epoch_idx=self.model.epoch)
             self.model.epoch += 1
             loader = iter(train_loader)
     
     def validation(self):
         ''' create data loader '''
-        drop_last = True
         train_loader = CustomDataLoader(
             config = self.config,
             dataset=self.dataset_train,
             batch_size=self.config.Batch_Size,
             num_workers=1, #self.config.WORKERS
-            drop_last=drop_last,
+            drop_last=False,
             shuffle=False,
             collate_fn=collate_fn_mmg_diff,
         )
@@ -251,41 +344,41 @@ class Pdiff4SSG_Pretraining():
         ''' Resume data loader to the last read location '''
         loader = iter(train_loader)
 
-        model_dicts = torch.load("/home/honsen/honsen/SceneGraph/SG_pretrain_diff/save_path/model_epoch_200.pth")
-        self.model.load_state_dict(model_dicts['model_state_dict'])
+        model_dicts = torch.load("/home/honsen/honsen/SceneGraph/SG_pretrain_diff/save_path/model_epoch_250.pth")
+        self.model.load_state_dict(model_dicts['model_state_dict'],strict=False)
 
         # model_dicts = torch.load("/home/honsen/tartan/ckpt-epoch-300.pth")
         # model_dicts = model_dicts['pointdif']
         # model_dicts = remove_module_prefix(model_dicts)
         # self.model.load_state_dict(model_dicts,)
         
+        all_edge_feats = []
+        all_obj_feats = []
         ''' Train '''
         self.model.eval()
-        istrain = False
-        while(keep_training):
 
-            if self.model.epoch > 1:#
-                break
-
-            print('\n\nTraining epoch: %d' % self.model.epoch)
                     
-            for batch_idx, items in enumerate(loader):
-                ''' get data '''
-                print("------training------")
-                obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial = self.data_processing_train_pdiff(items)
-                
-                ''' forward '''
-                if istrain:
-                    total_loss, diff_loss, diff_spatial_loss, total_spatial_metric, total_metric = self.model(obj_points.permute(0,2,1).contiguous(), edge_indices, obj_points_spatial, descriptor=descriptor, batch_ids=batch_ids, anchor_id=anchor_ids, istrain=istrain)
-                    print('Epoch: %d, Iteration: %d / %d, diff_spatial_loss: %.4f, diff_loss: %.4f, total_spatial_metric: %.4f, total_metric: %.4f' % (self.model.epoch, batch_idx+1, self.total, diff_spatial_loss.item(), diff_loss.item(), total_spatial_metric, total_metric))
-                else:
-                    with torch.no_grad():
-                        diff_loss, total_x0_metric = self.model(obj_points.permute(0,2,1).contiguous(), edge_indices, obj_points_spatial, descriptor=descriptor, batch_ids=batch_ids, anchor_id=anchor_ids, istrain=False)
-                        print('Epoch: %d, Iteration: %d / %d, total_x0_metric: %.4f, diff_loss: %.4f' % (self.model.epoch, batch_idx+1, self.total, total_x0_metric, diff_loss))
-            
-            self.model.epoch += 1
-            loader = iter(train_loader)
-    
+        for batch_idx, items in enumerate(loader):
+            ''' get data '''
+            print("------training------")
+            obj_points, descriptor, edge_indices, anchor_ids, batch_ids, obj_points_spatial, cur_obj_texts = self.data_processing_train_pdiff(items)
+        
+            with torch.no_grad():
+                diff_loss, total_x0_metric, gcn_edge_feature_3d, gcn_obj_feature_3d = self.model(obj_points.permute(0,2,1).contiguous(), edge_indices, obj_points_spatial, descriptor=descriptor, batch_ids=batch_ids, anchor_id=anchor_ids, istrain=False)
+                print('Epoch: %d, Iteration: %d / %d, total_x0_metric: %.4f, diff_loss: %.4f' % (self.model.epoch, batch_idx+1, self.total, total_x0_metric, diff_loss))
+        
+        
+            all_edge_feats.append(gcn_edge_feature_3d)
+            all_obj_feats.append(gcn_obj_feature_3d)
+        
+        all_edge_feats = torch.cat(all_edge_feats, dim=0)
+        all_obj_feats = torch.cat(all_obj_feats, dim=0)
+        
+        cluster_and_visualize(all_obj_feats, 100, title_prefix="Object Features",\
+                              save_path="/home/honsen/honsen/SceneGraph/SG_pretrain_diff/clustering_dir/object_features_cluster.png")
+        cluster_and_visualize(all_edge_feats, 50, title_prefix="Edge Features",\
+                              save_path="/home/honsen/honsen/SceneGraph/SG_pretrain_diff/clustering_dir/edge_features_cluster.png")
+        
     def cuda(self, *args):
         return [item.to(self.config.DEVICE) for item in args]
 

@@ -96,6 +96,7 @@ class PointNetfeat(BaseNetwork):
         self.point_size = point_size
         self.out_size = out_size
         
+        self.dropout = nn.Dropout(p=0.3)
         self.conv1 = torch.nn.Conv1d(point_size, 64, 1)
         self.conv2 = torch.nn.Conv1d(64, 128, 1)
         self.conv3 = torch.nn.Conv1d(128, out_size, 1)
@@ -142,6 +143,7 @@ class PointNetfeat(BaseNetwork):
         if self.use_batch_norm:
             self.bn1(x)
         x = self.relu(x)
+        x= self.dropout(x)
         
         if self.feature_transform:
             trans_feat = self.fstn(x)
@@ -155,10 +157,13 @@ class PointNetfeat(BaseNetwork):
         if self.use_batch_norm:
             self.bn2(x)
         x = self.relu(x)
+        x= self.dropout(x)
+        
         x = self.conv3(x)
         if self.use_batch_norm:
             self.bn3(x)
         x = self.relu(x)
+        x= self.dropout(x)
         
         x = torch.max(x, 2, keepdim=True)[0]
         x = x.view(-1, self.out_size)

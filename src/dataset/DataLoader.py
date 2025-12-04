@@ -183,6 +183,7 @@ def collate_fn_mmg(batch):
 
 def collate_fn_mmg_diff(batch):
     # batch
+    cur_obj_texts = []
     obj_point_list = []
     edge_indices, descriptor = [], []
     batch_ids = []
@@ -193,17 +194,19 @@ def collate_fn_mmg_diff(batch):
     for i, b in enumerate(batch):
 
         obj_point_list.append(b[0])
-
         descriptor.append(b[2])
-        
         edge_indices.append(b[3] + count)
         anchor_ids.append(b[4])
         obj_points_spatial.append(b[5])
+        cur_obj_texts+=b[6]
+        
         # accumulate batch number to make edge_indices match correct object index
         count += b[0].shape[0]
 
         # get batchs location
         batch_ids.append(torch.full((b[0].shape[0], 1), i))
 
-    return torch.cat(obj_point_list, dim=0), torch.cat(descriptor, dim=0),\
-           torch.cat(edge_indices, dim=0), anchor_ids, torch.cat(batch_ids, dim=0), torch.cat(obj_points_spatial, dim=0)
+    return  torch.cat(obj_point_list, dim=0), torch.cat(descriptor, dim=0),\
+            torch.cat(edge_indices, dim=0), anchor_ids, \
+            torch.cat(batch_ids, dim=0), torch.cat(obj_points_spatial, dim=0),\
+            cur_obj_texts

@@ -10,6 +10,86 @@ from utils import util_ply
 import trimesh
 import os
 
+def uniform_upsample_gpu(points, target_num, k=3):
+            import torch.nn.functional as F
+            """
+            基于局部稀疏度加权的均匀点云上采样 (PyTorch Vectorized)
+            
+            Args:
+                points: (B, N, 3) 原始点云 Tensor
+                target_num: 目标点数 (必须 > N)
+                k: 用于构建局部三角形的邻居数量 (推荐 3)
+                
+            Returns:
+                upsampled_points: (B, target_num, 3) 上采样后的点云
+            """
+            B, N, C = points.shape
+            assert target_num > N, "目标点数必须大于原始点数"
+            num_new_points = target_num - N
+            
+            # 1. 计算点与点之间的距离矩阵 (B, N, N)
+            # 注意：如果 N 非常大 (>10000)，cdist 可能会显存溢出，需分批处理
+            dists = torch.cdist(points, points)
+            
+            # 2. 找到每个点的 k 个最近邻 (排除自己，所以取 k+1)
+            # values: (B, N, k+1), indices: (B, N, k+1)
+            knn_dists, knn_indices = torch.topk(dists, k=k+1, dim=-1, largest=False)
+            
+            # 去掉第一个（也就是自己），保留 k 个邻居
+            # neighbor_indices: (B, N, k)
+            neighbor_indices = knn_indices[:, :, 1:]
+            
+            # 3. 计算稀疏度权重 (Sparsity Weights)
+            # 计算每个点到其 k 个邻居的平均距离。距离越大，说明周围越空，越需要插值。
+            # mean_dists: (B, N)
+            avg_local_dist = knn_dists[:, :, 1:].mean(dim=-1)
+            
+            # 归一化为概率分布 (Probability Distribution)
+            # 使用 Softmax 放大差异，让稀疏区域更容易被选中
+            # 也可以直接用 avg_local_dist / sum，Softmax 会更激进地填充大洞
+            weights = F.softmax(avg_local_dist, dim=-1) 
+            
+            # 4. 根据稀疏度选择要进行插值的中心点 (B, num_new_points)
+            # torch.multinomial 可以根据权重进行采样
+            # 这里的 indices 是我们要在这个点周围生成新点的索引
+            sample_indices = torch.multinomial(weights, num_new_points, replacement=True)
+            
+            # 5. 收集生成所需的几何信息
+            # 获取中心点坐标: (B, num_new, 3)
+            batch_indices = torch.arange(B, device=points.device).unsqueeze(-1).expand(-1, num_new_points)
+            center_points = points[batch_indices, sample_indices] # P_A
+            
+            # 获取中心点的邻居索引
+            # neighbor_indices 的形状是 (B, N, k)，我们需要取 sample_indices 对应的行
+            # select_neighbor_indices: (B, num_new, k)
+            select_neighbor_indices = neighbor_indices[batch_indices, sample_indices]
+            
+            # 随机从 k 个邻居中选 2 个，加上中心点构成一个三角形
+            # 这里为了简单，我们直接取第1个和第2个邻居 (也可以随机选)
+            n1_indices = select_neighbor_indices[:, :, 0]
+            n2_indices = select_neighbor_indices[:, :, 1]
+            
+            p1 = points[batch_indices, n1_indices] # P_B
+            p2 = points[batch_indices, n2_indices] # P_C
+            
+            # 6. 在三角形 (center, p1, p2) 内部进行均匀采样
+            # 使用重心坐标 (Barycentric Coordinates) 确保三角形内均匀
+            # 公式: P = (1 - sqrt(r1)) * A + sqrt(r1) * (1 - r2) * B + sqrt(r1) * r2 * C
+            r1 = torch.rand((B, num_new_points, 1), device=points.device)
+            r2 = torch.rand((B, num_new_points, 1), device=points.device)
+            
+            sqrt_r1 = torch.sqrt(r1)
+            
+            # 计算新点坐标
+            new_points = (1 - sqrt_r1) * center_points + \
+                        sqrt_r1 * (1 - r2) * p1 + \
+                        sqrt_r1 * r2 * p2
+                        
+            # 7. 拼接原始点和新点
+            final_points = torch.cat([points, new_points], dim=1)
+            
+            return final_points
+
 def visualize_scenes_batch(scene1_tensor, scene2_tensor, output_dir="batch_visualizations"):
     """
     将两个 (B, N, 3) 的点云 Tensor 中的每一个样本分别绘制，
@@ -350,8 +430,18 @@ class PdiffDatasetGraph(data.Dataset):
         instances = np.load(os.path.join(curScenePath, "sensorsData/instance.npy"))
 
         selected_rels = sub_graph_sample["edges"]
-        all_nodes_cur = sub_graph_sample["nodes"]        
-        # --- [!!! 关键修改 START !!!] ---
+        all_nodes_cur = sub_graph_sample["nodes"]
+        
+        obj_labels = os.path.join(curScenePath, "sensorsData/object_labels.json")
+        
+        if not os.path.exists(obj_labels):
+            cur_obj_texts = ["unknown" for _ in all_nodes_cur]
+        else:
+            with open(obj_labels, 'r') as f:
+                obj_labels_data = json.load(f)    
+            # --- [!!! 关键修改 START !!!] ---
+            
+            cur_obj_texts = [obj_labels_data[str(i)] for i in all_nodes_cur]
         
         # 1. 获取 "实例ID" (e.g., 22)
         #    这是 ScanNet 的原始掩码 ID，不是 obj_points 的索引
@@ -375,12 +465,12 @@ class PdiffDatasetGraph(data.Dataset):
         obj_points, rel_points, obj_points_spatial, edge_indices, descriptor = \
             self.data_preparation(points, instances, self.num_points, self.num_points_union, all_nodes_cur, selected_rels,
                                   padding=0.2)
-
+        
         while (len(rel_points) == 0) and self.for_train:
             index = np.random.randint(self.__len__())
-            obj_points, rel_points, descriptor, edge_indices, anchor_index, obj_points_spatial = self.__getitem__(index)
+            obj_points, rel_points, descriptor, edge_indices, anchor_index, obj_points_spatial, cur_obj_texts = self.__getitem__(index)
 
-        return obj_points, rel_points, descriptor, edge_indices, anchor_index, obj_points_spatial
+        return obj_points, rel_points, descriptor, edge_indices, anchor_index, obj_points_spatial, cur_obj_texts
 
 
 
@@ -472,94 +562,6 @@ class PdiffDatasetGraph(data.Dataset):
         obj_points_spatial = obj_points_spatial.view(B*N, -1)
         obj_points_spatial[:, :3] = self.zero_mean(obj_points_spatial[:, :3]) 
         obj_points_spatial = obj_points_spatial.view(B, N, -1)
-        
-        def uniform_upsample_gpu(points, target_num, k=3):
-            import torch.nn.functional as F
-            """
-            基于局部稀疏度加权的均匀点云上采样 (PyTorch Vectorized)
-            
-            Args:
-                points: (B, N, 3) 原始点云 Tensor
-                target_num: 目标点数 (必须 > N)
-                k: 用于构建局部三角形的邻居数量 (推荐 3)
-                
-            Returns:
-                upsampled_points: (B, target_num, 3) 上采样后的点云
-            """
-            B, N, C = points.shape
-            assert target_num > N, "目标点数必须大于原始点数"
-            num_new_points = target_num - N
-            
-            # 1. 计算点与点之间的距离矩阵 (B, N, N)
-            # 注意：如果 N 非常大 (>10000)，cdist 可能会显存溢出，需分批处理
-            dists = torch.cdist(points, points)
-            
-            # 2. 找到每个点的 k 个最近邻 (排除自己，所以取 k+1)
-            # values: (B, N, k+1), indices: (B, N, k+1)
-            knn_dists, knn_indices = torch.topk(dists, k=k+1, dim=-1, largest=False)
-            
-            # 去掉第一个（也就是自己），保留 k 个邻居
-            # neighbor_indices: (B, N, k)
-            neighbor_indices = knn_indices[:, :, 1:]
-            
-            # 3. 计算稀疏度权重 (Sparsity Weights)
-            # 计算每个点到其 k 个邻居的平均距离。距离越大，说明周围越空，越需要插值。
-            # mean_dists: (B, N)
-            avg_local_dist = knn_dists[:, :, 1:].mean(dim=-1)
-            
-            # 归一化为概率分布 (Probability Distribution)
-            # 使用 Softmax 放大差异，让稀疏区域更容易被选中
-            # 也可以直接用 avg_local_dist / sum，Softmax 会更激进地填充大洞
-            weights = F.softmax(avg_local_dist, dim=-1) 
-            
-            # 4. 根据稀疏度选择要进行插值的中心点 (B, num_new_points)
-            # torch.multinomial 可以根据权重进行采样
-            # 这里的 indices 是我们要在这个点周围生成新点的索引
-            sample_indices = torch.multinomial(weights, num_new_points, replacement=True)
-            
-            # 5. 收集生成所需的几何信息
-            # 获取中心点坐标: (B, num_new, 3)
-            batch_indices = torch.arange(B, device=points.device).unsqueeze(-1).expand(-1, num_new_points)
-            center_points = points[batch_indices, sample_indices] # P_A
-            
-            # 获取中心点的邻居索引
-            # neighbor_indices 的形状是 (B, N, k)，我们需要取 sample_indices 对应的行
-            # select_neighbor_indices: (B, num_new, k)
-            select_neighbor_indices = neighbor_indices[batch_indices, sample_indices]
-            
-            # 随机从 k 个邻居中选 2 个，加上中心点构成一个三角形
-            # 这里为了简单，我们直接取第1个和第2个邻居 (也可以随机选)
-            n1_indices = select_neighbor_indices[:, :, 0]
-            n2_indices = select_neighbor_indices[:, :, 1]
-            
-            p1 = points[batch_indices, n1_indices] # P_B
-            p2 = points[batch_indices, n2_indices] # P_C
-            
-            # 6. 在三角形 (center, p1, p2) 内部进行均匀采样
-            # 使用重心坐标 (Barycentric Coordinates) 确保三角形内均匀
-            # 公式: P = (1 - sqrt(r1)) * A + sqrt(r1) * (1 - r2) * B + sqrt(r1) * r2 * C
-            r1 = torch.rand((B, num_new_points, 1), device=points.device)
-            r2 = torch.rand((B, num_new_points, 1), device=points.device)
-            
-            sqrt_r1 = torch.sqrt(r1)
-            
-            # 计算新点坐标
-            new_points = (1 - sqrt_r1) * center_points + \
-                        sqrt_r1 * (1 - r2) * p1 + \
-                        sqrt_r1 * r2 * p2
-                        
-            # 7. 拼接原始点和新点
-            final_points = torch.cat([points, new_points], dim=1)
-            
-            return final_points
-
-        # 对局部坐标点云插值
-        obj_points = uniform_upsample_gpu(obj_points, 1024)*1.5
-        # 对空间坐标点云插值
-        # obj_points_spatial = uniform_upsample_gpu(obj_points_spatial, 1024)*1.5
-        
-        # 此时 obj_points 和 obj_points_spatial 的 shape 变成了 [B, 1024, 3]
-        # ---------------------------------------------------------------------
         
         # visualize_scenes_plt(obj_points, obj_points_spatial,"/home/honsen/honsen/SceneGraph/SG_pretrain_diff/src/dataset/qwe.png")
         

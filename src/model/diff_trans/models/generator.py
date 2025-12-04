@@ -180,7 +180,7 @@ class CPDM(nn.Module):
         super().__init__()
         self.config = config
         self.cond_dims = self.config.generator_config.cond_dims 
-        self.net = DenoisingNet(point_dim=3, cond_dims=self.cond_dims, residual=True)
+        self.net = DenoisingNet(point_dim=3, cond_dims=512, residual=True)
         self.var_sched = VarianceSchedule(config)
         self.interval_nums = self.config.generator_config.interval_nums
     

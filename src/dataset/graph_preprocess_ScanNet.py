@@ -155,7 +155,7 @@ def preprocess_scan_scene(scan_id: str, data_path: str):
         data_path (str): 数据存储路径。
     """
     try:
-        K_MIN = 4  # 每个子图的最小尺寸
+        K_MIN = 3  # 每个子图的最小尺寸
         # 加载点云数据
         point_cloud = np.load(f"{data_path}/sensorsData/points.npy")  # Nx3
         object_labels = np.load(f"{data_path}/sensorsData/instance.npy")  # N
@@ -207,7 +207,7 @@ def preprocess_scanNet_main(ScanNet_dirs):
     
     # 将JSON文件保存在 ScanNet_dirs 的上一级目录中
     output_directory = os.path.dirname(ScanNet_dirs)
-    output_filepath = os.path.join(output_directory, "training_samples.json")
+    output_filepath = os.path.join(output_directory, "training_samples2.json")
     
     if not all_scenes_data:
         print("未处理任何有效场景，不生成JSON文件。")

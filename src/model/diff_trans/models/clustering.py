@@ -31,7 +31,7 @@ def cluster_and_visualize(tensor_data: torch.Tensor,
     
     # 1. Data Preparation: Convert Tensor to Numpy
     if tensor_data.is_cuda:
-        data_np = tensor_data.cpu().numpy()
+        data_np = tensor_data.detach().cpu().numpy()
     else:
         data_np = tensor_data.numpy()
 

@@ -7,10 +7,10 @@ from xml.dom.minidom import Node
 from src.dataset.dataset_diffPoint import PdiffDatasetGraph
 def build_dataset(split,
                 for_train,
-                point_sample_num=512,
-                point_union_num=512*2,
+                point_sample_num=1024,
+                point_union_num=1024*2,
                 root_ScanNet="/home/honsen/tartan/ScanNet/scans",
-                json_path="/home/honsen/tartan/ScanNet/training_samples.json",
+                json_path="/home/honsen/tartan/ScanNet/training_samples2.json",
                 max_edges=-1):
     
     dataset = PdiffDatasetGraph(
