@@ -1,0 +1,13 @@
+# 忽略文件夹
+feature_analysis/
+save_path/
+checkpoints/
+
+# 忽略特定类型的文件
+*.pth
+*.tar.gz
+*.vscode
+*.pt
+
+# Python 编译缓存
+__pycache__/
