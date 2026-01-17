@@ -1,26 +1,36 @@
 import os
 import json
+import argparse
 import torch
-import clip
+try:
+    import clip
+except ModuleNotFoundError:
+    clip = None
 from tqdm import tqdm
 
-def generate_scannet_embeddings():
+def generate_scannet_embeddings(root_dir: str, output_path: str, model_name: str, prompt_template: str):
     # ================= 配置区域 =================
     # 你的 ScanNet 数据根目录
-    root_dir = "/home/honsen/tartan/ScanNet/scans"
+    root_dir = root_dir
     
     # 结果保存路径
-    output_path = "/home/honsen/honsen/SceneGraph/SG_pretrain_diff/scannet_text_embeddings.pt"
+    output_path = output_path
     
     # CLIP 模型版本
-    model_name = "ViT-B/32"
+    model_name = model_name
     
     # 提示词模板
-    prompt_template = "a point cloud of {}."
+    prompt_template = prompt_template
     # ===========================================
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"正在使用设备: {device}")
+
+    if clip is None:
+        raise ModuleNotFoundError(
+            "Python package 'clip' not found. Install OpenAI CLIP first, e.g.: "
+            "python3 -m pip install git+https://github.com/openai/CLIP.git"
+        )
 
     # 1. 收集所有场景中出现过的唯一类别名称
     print("正在扫描所有场景目录以收集类别标签...")
@@ -92,7 +102,38 @@ def generate_scannet_embeddings():
     print(f"Embedding 形状: {list(result_dict.values())[0].shape}")
 
 if __name__ == "__main__":
-    text_embeddings = torch.load("/home/honsen/honsen/SceneGraph/SG_pretrain_diff/scannet_text_embeddings.pt")
-    print(f"加载的 Embeddings 包含 {len(text_embeddings)} 个类别。")
-    
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--root_dir",
+        type=str,
+        default=os.environ.get(
+            "SCANNET_SCANS_ROOT",
+            "/data0/jiangxiangwei/Diff-SGG/data/ScanNet_merged_v2_20k_uniform_copy/scans",
+        ),
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default=os.environ.get(
+            "SCANNET_TEXT_EMB_PATH",
+            "/data0/jiangxiangwei/Diff-SGG/outputs/scannet_text_embeddings.pt",
+        ),
+    )
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        default=os.environ.get("CLIP_MODEL_NAME", "ViT-B/32"),
+    )
+    parser.add_argument(
+        "--prompt_template",
+        type=str,
+        default=os.environ.get("CLIP_PROMPT_TEMPLATE", "a point cloud of {}."),
+    )
+    args = parser.parse_args()
+
+    generate_scannet_embeddings(
+        root_dir=args.root_dir,
+        output_path=args.output_path,
+        model_name=args.model_name,
+        prompt_template=args.prompt_template,
+    )

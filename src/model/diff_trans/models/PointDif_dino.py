@@ -22,6 +22,7 @@ from src.dataset.dataset_diffPoint import visualize_scenes_plt, visualize_scenes
 
 from src.model.diff_trans.models.weight_focal_loss import compute_adaptive_weight, compute_local_complexity_weight
 from src.model.diff_trans.models.swav_loss import SwAVLoss
+from src.model.diff_trans.models.mcr_loss import MCRLoss
 from src.model.diff_trans.models.contrastive_loss import TextSupervisedContrastiveLoss
 import copy
 
@@ -78,6 +79,8 @@ class PointDif(BaseModel):
         self.momentum = 0.996
         self.model_pre = None
 
+        # 把原始几何/局部描述压到一个统一的高维 embedding
+        # 点云关系编码器
         self.rel_encoder_3d = PointNetfeat(
             global_feat=True,
             batch_norm=with_bn,
@@ -85,7 +88,8 @@ class PointDif(BaseModel):
             input_transform=False,
             feature_transform=mconfig.feature_transform,
             out_size=512)
-
+        # 图/关系建模模块 
+        # 在做“点-点/组-组关系推理”，像一个带注意力的图网络/Transformer
         self.mmg = MMG(
             dim_node=512,
             dim_edge=512,
@@ -98,26 +102,42 @@ class PointDif(BaseModel):
             use_edge=True,#self.mconfig.USE_GCN_EDGE
             DROP_OUT_ATTEN=0.5)#self.mconfig.DROP_OUT_ATTEN
         
+        # PointNet 把“每个局部”变成向量；
+        # MMG 再让这些向量之间“互相看一眼”，把关系信息编码进去
+        # 这里是典型的“把点云分块 + 做 MAE 风格的 mask 学习”：
+        # Group(num_group, group_size)：把点云划分成 G 个 group，每组 S 个点
+        # Mask_Encoder：对“可见的 group tokens”做 Transformer 编码
+        # mask_token：被 mask 的位置用一个可学习 token 代替（类似 BERT/MAE）
         self.config = config.maskTrans
         self.group_size = self.config.group_size
         self.num_group = self.config.num_group
         self.trans_dim = self.config.encoder_config.trans_dim
         self.mask_encoder = Mask_Encoder(self.config)
         self.encoder_dims = self.config.encoder_config.encoder_dims
-        
+        # 把 512 压成 512-11（看起来是为了和某个 11 维描述拼接/对齐，
+        # 或者留出描述维度做残差/拼接）
         self.mlp_3d = torch.nn.Sequential(
             torch.nn.Linear(512, 512 - 11),
             torch.nn.ReLU(),
             torch.nn.Dropout(0.3)
         )
+        # 用来把 transformer 编码出来的东西和 3D/关系特征融合到 512 维
         self.ca_net = CANet(self.encoder_dims, 512)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
+        # 说明除了点/组 token，还对边/关系也做 mask 编码（更像“结构化 mask”）
         self.edge_mask_token = MaskedEdgeEncoder(512)
-        
+        # 输入是 512*3，说明它把 3 个实体拼起来
+        # （例如：subject-predicate-object 或者 三元组关系特征），映射到 600 个原型
         self.prototypes_triplet = nn.Linear(512*3, 600, bias=False)
+        # 边/关系特征映射到 200 个原型
+        # 把特征投到 K=200 个原型上（相当于聚类中心）
         self.prototypes_edge = nn.Linear(512, 200, bias=False)
+        # 物体/节点特征映射到 1000 个原型
         self.prototypes_obj = nn.Linear(512, 1000, bias=False)
-
+        # SwAV 的核心是：
+        # 不用人工标签，把特征投到 K 个“原型中心”，
+        # 再用 Sinkhorn 求一个“均衡分配”的伪标签，逼不同视角的同一个样本分配一致
+        
         # --- 2. Target Network (Teacher) ---
         # 深度拷贝 Online 网络
         self.mask_encoder_target = copy.deepcopy(self.mask_encoder)
@@ -139,6 +159,12 @@ class PointDif(BaseModel):
         self.swav_reg_triplet = SwAVLoss(self.prototypes_triplet, self.prototypes_triplet_target)
         self.swav_reg_edge = SwAVLoss(self.prototypes_edge, self.prototypes_edge_target)   
         self.swav_reg_obj = SwAVLoss(self.prototypes_obj, self.prototypes_obj_target)        
+
+        self.mcr_edge_loss = MCRLoss(out_dim=512, reduce_cov=1)
+        self._last_edge_mcr_stats = None
+
+        self.mcr_obj_loss = MCRLoss(out_dim=512, reduce_cov=1)
+        self._last_obj_mcr_stats = None
         
         self.point_diffusion = CPDM(self.config)
         self.count = 0
@@ -195,7 +221,8 @@ class PointDif(BaseModel):
                )
 
     @torch.no_grad()
-    def _update_target(self):
+    def _update_target(self, momentum):
+        self.momentum = momentum
         for p_o, p_t in zip(self.get_online_params(), self.get_target_params()):
             p_t.data = p_t.data * self.momentum + p_o.data * (1. - self.momentum)
     
@@ -324,7 +351,7 @@ class PointDif(BaseModel):
             
             # 将 mask_token 广播并覆盖原特征
             # 注意：这里直接修改 rel_feature_3d_view 的部分行
-        rel_feature_3d_view[mask_indices] = mask_token.expand(num_masked, -1)
+            rel_feature_3d_view[mask_indices] = mask_token.expand(num_masked, -1)
         return rel_feature_3d_view, mask_indices
     
     def student_view_construct(self, pts, edge_indices, descriptor, batch_ids, edge_mask_ratio=0.3, obj_center=None, anchor_id=None, istrain=False):
@@ -354,7 +381,7 @@ class PointDif(BaseModel):
         with torch.no_grad():
             edge_feature = op_utils.Gen_edge_descriptor()(descriptor, edge_indices)
         with torch.no_grad():
-            self._update_target()
+            # self._update_target()
             point_agg_features_view2 = self.obj_feat_extractor(pts, None, batch_ids, descriptor, mask_ratio = mask_ratio, istarget=True)
             rel_feature_3d_view2 = self.rel_encoder_3d_target(edge_feature)
             
@@ -468,26 +495,56 @@ class PointDif(BaseModel):
         # -------------------------------------------------------------
         # 1. Object Loss (SwAV / DINO Style)
         # -------------------------------------------------------------
-        # v1(Stu, View1) <-> v6(Tea, View2)
-        loss_obj_cross1 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v6, pred_obj_v1)
-        # v2(Stu, View2) <-> v5(Tea, View1)
-        loss_obj_cross2 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v5, pred_obj_v2)
-        # v3(Stu, View1_Masked) <-> v6(Tea, View2)
-        loss_obj_cross3 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v6, pred_obj_v3)
-        # v4(Stu, View2_Masked) <-> v5(Tea, View1)
-        loss_obj_cross4 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v5, pred_obj_v4)
+        loss_obj_cross1, stats_obj_1 = self.mcr_obj_loss([pred_obj_v1], [obj_feat_tea_v6])
+        loss_obj_cross2, stats_obj_2 = self.mcr_obj_loss([pred_obj_v2], [obj_feat_tea_v5])
+        loss_obj_cross3, stats_obj_3 = self.mcr_obj_loss([pred_obj_v3], [obj_feat_tea_v6])
+        loss_obj_cross4, stats_obj_4 = self.mcr_obj_loss([pred_obj_v4], [obj_feat_tea_v5])
 
         obj_loss = (loss_obj_cross1 + loss_obj_cross2 + loss_obj_cross3 + loss_obj_cross4) / 4.0
+
+        with torch.no_grad():
+            comp_vals = [stats_obj_1['comp_loss'], stats_obj_2['comp_loss'], stats_obj_3['comp_loss'], stats_obj_4['comp_loss']]
+            expa_vals = [stats_obj_1['expa_loss'], stats_obj_2['expa_loss'], stats_obj_3['expa_loss'], stats_obj_4['expa_loss']]
+            self._last_obj_mcr_stats = {
+                'obj_loss': obj_loss.detach(),
+                'comp_loss': torch.stack(comp_vals).mean().detach(),
+                'expa_loss': torch.stack(expa_vals).mean().detach(),
+            }
 
         # -------------------------------------------------------------
         # 2. Edge Loss
         # -------------------------------------------------------------
-        loss_edg_cross1 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v6, pred_edg_v1)
-        loss_edg_cross2 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v5, pred_edg_v2)
-        loss_edg_cross3 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v6[mask_indices_v3], pred_edg_v3[mask_indices_v3])
-        loss_edg_cross4 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v5[mask_indices_v4], pred_edg_v4[mask_indices_v4])
+        loss_edg_cross1, stats_edg_1 = self.mcr_edge_loss([pred_edg_v1], [edg_feat_tea_v6])
+        loss_edg_cross2, stats_edg_2 = self.mcr_edge_loss([pred_edg_v2], [edg_feat_tea_v5])
+
+        if mask_indices_v3 is not None and mask_indices_v3.any():
+            loss_edg_cross3, stats_edg_3 = self.mcr_edge_loss([pred_edg_v3[mask_indices_v3]], [edg_feat_tea_v6[mask_indices_v3]])
+        else:
+            loss_edg_cross3 = loss_edg_cross1.new_zeros(())
+            stats_edg_3 = None
+
+        if mask_indices_v4 is not None and mask_indices_v4.any():
+            loss_edg_cross4, stats_edg_4 = self.mcr_edge_loss([pred_edg_v4[mask_indices_v4]], [edg_feat_tea_v5[mask_indices_v4]])
+        else:
+            loss_edg_cross4 = loss_edg_cross1.new_zeros(())
+            stats_edg_4 = None
 
         edge_loss = (loss_edg_cross1 + loss_edg_cross2 + loss_edg_cross3 + loss_edg_cross4) / 4.0
+
+        with torch.no_grad():
+            comp_vals = [stats_edg_1['comp_loss'], stats_edg_2['comp_loss']]
+            expa_vals = [stats_edg_1['expa_loss'], stats_edg_2['expa_loss']]
+            if stats_edg_3 is not None:
+                comp_vals.append(stats_edg_3['comp_loss'])
+                expa_vals.append(stats_edg_3['expa_loss'])
+            if stats_edg_4 is not None:
+                comp_vals.append(stats_edg_4['comp_loss'])
+                expa_vals.append(stats_edg_4['expa_loss'])
+            self._last_edge_mcr_stats = {
+                'edge_loss': edge_loss.detach(),
+                'comp_loss': torch.stack(comp_vals).mean().detach(),
+                'expa_loss': torch.stack(expa_vals).mean().detach(),
+            }
 
         # -------------------------------------------------------------
         # 3. Triplet Loss

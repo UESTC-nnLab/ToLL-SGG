@@ -1,4 +1,5 @@
 import torch
+import os
 import sys
 sys.path.append('/home/hyc/hyc_work/sceneGraph/SGG_DIR')
 
@@ -64,6 +65,12 @@ class PointDif(BaseModel):
         print_log(f'[Diff_sg] ', logger ='Diff_sg')
         
         self.mconfig = mconfig = config.sg_model
+        self.text_emb_path = (
+            getattr(config, 'SCANNET_TEXT_EMB_PATH', None)
+            or getattr(config, 'text_emb_path', None)
+            or getattr(mconfig, 'SCANNET_TEXT_EMB_PATH', None)
+            or getattr(mconfig, 'text_emb_path', None)
+        )
         
         with_bn = mconfig.WITH_BN
 
@@ -290,8 +297,25 @@ class PointDif(BaseModel):
 
             contrastive_loss = 0.0
             if cur_obj_texts is not None:
-                text_embeddings_dict = torch.load('/home/hyc/hyc_work/sceneGraph/SGG_DIR/scannet_text_embeddings.pt')
-                contrastive_loss = self.contrastive_loss_fn(point_agg_features_spatial_view1, cur_obj_texts, text_embeddings_dict)#+self.contrastive_loss_fn(point_agg_features_spatial_view2, cur_obj_texts, text_embeddings_dict)
+                text_emb_path = self.text_emb_path or os.environ.get(
+                    'SCANNET_TEXT_EMB_PATH',
+                    '/home/hyc/hyc_work/sceneGraph/SGG_DIR/scannet_text_embeddings.pt'
+                )
+                if os.path.exists(text_emb_path):
+                    try:
+                        text_embeddings_dict = torch.load(text_emb_path, map_location='cpu')
+                        contrastive_loss = self.contrastive_loss_fn(
+                            point_agg_features_spatial_view1, cur_obj_texts, text_embeddings_dict
+                        )
+                    except Exception:
+                        # If embedding file is corrupted/incompatible, skip contrastive loss.
+                        if not hasattr(self, '_skip_text_contrastive_warned'):
+                            self._skip_text_contrastive_warned = True
+                            print(f"[Warning] Failed to load text embeddings from '{text_emb_path}'. Skip contrastive loss.")
+                else:
+                    if not hasattr(self, '_skip_text_contrastive_warned'):
+                        self._skip_text_contrastive_warned = True
+                        print(f"[Warning] Text embedding file '{text_emb_path}' not found. Skip contrastive loss.")
 
             triplet_view1 = self.generate_object_pair_features(point_agg_features_spatial_view1, gcn_edge_feature_3d, edge_indices.t())
             
@@ -304,11 +328,11 @@ class PointDif(BaseModel):
             return total_loss, diff_loss, contrastive_loss, total_metric, gcn_edge_feature_3d
         else:
             
-            # pred_points = self.point_diffusion.sample(1024, point_agg_features_spatial, "cuda")
+            # pred_points = self.point_diffusion.sample(1024, point_agg_features, "cuda")
             # pred_points, collected_frames = self.point_diffusion.sampleN(1024, point_agg_features_spatial, "cuda", capture_range=(500,0),capture_num=20)
             diff_loss, total_x0_metric = self.point_diffusion.get_loss1(pts, point_agg_features_spatial_view1)
                 
-            # visualize_scenes_plt(pred_points, obj_points_spatial, output_filename=f'/home/honsen/honsen/SceneGraph/SG_pretrain_diff/sample_dir/sample_{self.count}.png')
+            # visualize_scenes_plt(pred_points, obj_points_spatial, output_filename=f'/home/hyc/hyc_work/sceneGraph/SGG_DIR/sample_dir/sample_{self.count}.png')
             # visualize_scenes_batch(pred_points, obj_points_spatial, output_dir=f'/home/honsen/honsen/SceneGraph/SG_pretrain_diff/sample_dir/batch_sample_{self.count}')
             # visualize_and_save_sequence(collected_frames, save_path=f'/home/honsen/honsen/SceneGraph/SG_pretrain_diff/sample_dir/sequence_sample_{self.count}')
            
@@ -331,7 +355,7 @@ class PointDif(BaseModel):
             = self.mmg(point_agg_features, rel_feature_3d, edge_indices, batch_ids, global_anchor_indices, obj_center, istrain=istrain)
 
        
-        point_agg_features_spatial_view1 = gcn_obj_feature_3d 
+        point_agg_features_spatial_view1 = gcn_obj_feature_3d
         if istrain:
             weights = compute_local_complexity_weight(obj_points_spatial, 8)
             
@@ -339,8 +363,24 @@ class PointDif(BaseModel):
 
             contrastive_loss = 0.0
             if cur_obj_texts is not None:
-                text_embeddings_dict = torch.load('/home/hyc/hyc_work/sceneGraph/SGG_DIR/scannet_text_embeddings.pt')
-                contrastive_loss = self.contrastive_loss_fn(point_agg_features_spatial_view1, cur_obj_texts, text_embeddings_dict)
+                text_emb_path = self.text_emb_path or os.environ.get(
+                    'SCANNET_TEXT_EMB_PATH',
+                    '/home/hyc/hyc_work/sceneGraph/SGG_DIR/scannet_text_embeddings.pt'
+                )
+                if os.path.exists(text_emb_path):
+                    try:
+                        text_embeddings_dict = torch.load(text_emb_path, map_location='cpu')
+                        contrastive_loss = self.contrastive_loss_fn(
+                            point_agg_features_spatial_view1, cur_obj_texts, text_embeddings_dict
+                        )
+                    except Exception:
+                        if not hasattr(self, '_skip_text_contrastive_warned'):
+                            self._skip_text_contrastive_warned = True
+                            print(f"[Warning] Failed to load text embeddings from '{text_emb_path}'. Skip contrastive loss.")
+                else:
+                    if not hasattr(self, '_skip_text_contrastive_warned'):
+                        self._skip_text_contrastive_warned = True
+                        print(f"[Warning] Text embedding file '{text_emb_path}' not found. Skip contrastive loss.")
             
             total_loss = diff_loss #+ 0.02*contrastive_loss
             

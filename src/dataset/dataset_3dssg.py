@@ -67,13 +67,15 @@ class SSGDatasetGraph(data.Dataset):
                  use_normal,
                  label_type,
                  for_train,
-                 max_edges = -1):
+                 max_edges = -1,
+                 root=None,
+                 root_3rscan=None):
         assert split in ['train_scans', 'validation_scans']
         self.for_train = for_train
         
-        self.root = "/home/hyc/hyc_work/sceneGraph/SGG_DIR/data/3DSSG_subset"
+        self.root = root if root is not None else "/home/hyc/hyc_work/sceneGraph/SGG_DIR/data/3DSSG_subset"
         self.label_file = "labels.instances.align.annotated.v2.ply"
-        self.root_3rscan = define.DATA_PATH
+        self.root_3rscan = root_3rscan if root_3rscan is not None else define.DATA_PATH
         self.label_type = label_type
         self.scans = []
         self.multi_rel_outputs = multi_rel_outputs

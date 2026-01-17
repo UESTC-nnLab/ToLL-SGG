@@ -95,12 +95,15 @@ class Pdiff4SSG_Pretraining_ddp():
         
         # 只在主进程创建目录
         if is_main_process():
-            pass
+            dataset_cfg = getattr(self.config, 'dataset', None)
+            val_root = getattr(dataset_cfg, 'root', None) if dataset_cfg is not None else None
+            val_root_3rscan = getattr(dataset_cfg, 'root_3rscan', None) if dataset_cfg is not None else None
+            print(f"[Config] Validation dataset roots: dataset.root={val_root}, dataset.root_3rscan={val_root_3rscan}")
 
         ''' Build dataset ''' 
         # 注意：多卡训练时，每个卡只看到总数据的一部分，所以这里 len 计算的只是总数
         if val_cls_mode:      
-            self.dataset_train = build_dataset_for_clustering()
+            self.dataset_train = build_dataset_for_clustering(self.config)
         else:
             self.dataset_train = build_dataset("train_scannet", for_train=True,\
                 root_ScanNet=self.config.root_ScanNet, json_path=self.config.json_path)
@@ -136,9 +139,7 @@ class Pdiff4SSG_Pretraining_ddp():
         param_groups.extend(get_param_groups(self.model.predictor_obj, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
         
         # 2. 特殊模块: SwAV Prototypes
-        param_groups.append({'params': self.model.swav_reg_edge.parameters(), 'lr': float(config.LR), 'weight_decay': 0.0, 'amsgrad': self.config.AMSGRAD})
         param_groups.append({'params': self.model.swav_reg_triplet.parameters(), 'lr': float(config.LR), 'weight_decay': 0.0, 'amsgrad': self.config.AMSGRAD})
-        param_groups.append({'params': self.model.swav_reg_obj.parameters(), 'lr': float(config.LR), 'weight_decay': 0.0, 'amsgrad': self.config.AMSGRAD})
         
         # 3. 特殊模块: MMG
         param_groups.extend(get_param_groups(self.model.mmg, float(config.LR)/2, self.config.W_DECAY, self.config.AMSGRAD))
@@ -244,28 +245,53 @@ class Pdiff4SSG_Pretraining_ddp():
             
             # [DDP] map_location 确保加载到当前 GPU
             checkpoint = torch.load(resume_path, map_location=self.device)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
             
             # [DDP] 加载模型参数到 raw_model (处理可能的 module. 前缀不匹配问题)
             # 如果保存的是 DDP 模型 (带 module.)，可以直接加载到 self.model
             # 如果保存的是原始模型，加载到 self.raw_model
             # 为了通用性，通常建议保存 raw_model.state_dict()，这里假设 checkpoint 可能带 module.
             try:
-                self.model.load_state_dict(checkpoint['model_state_dict'])
-            except:
-                # 尝试加载到 raw_model (如果 checkpoint 没有 module. 前缀)
-                self.raw_model.load_state_dict(checkpoint['model_state_dict'])
+                self.model.load_state_dict(state_dict, strict=True)
+                if is_main_process():
+                    print("[Info] Loaded model_state_dict with strict=True (DDP model).")
+            except Exception as e:
+                if is_main_process():
+                    print(f"[Warning] strict=True load into DDP model failed, will try strict=False / raw_model. Error: {e}")
+                try:
+                    incompatible = self.model.load_state_dict(state_dict, strict=False)
+                    if is_main_process():
+                        print(f"[Warning] Loaded model_state_dict with strict=False (DDP model). Missing: {len(incompatible.missing_keys)}, Unexpected: {len(incompatible.unexpected_keys)}")
+                except Exception:
+                    sd_no_module = {
+                        (k[len('module.'):] if k.startswith('module.') else k): v
+                        for k, v in state_dict.items()
+                    }
+                    incompatible = self.raw_model.load_state_dict(sd_no_module, strict=False)
+                    if is_main_process():
+                        print(f"[Warning] Loaded model_state_dict into raw_model with strict=False. Missing: {len(incompatible.missing_keys)}, Unexpected: {len(incompatible.unexpected_keys)}")
 
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            if 'scheduler_state_dict' in checkpoint:
-                self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            optimizer_loaded = False
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                optimizer_loaded = True
+            except Exception as e:
+                if is_main_process():
+                    print(f"[Warning] Failed to load optimizer_state_dict (param_groups may have changed). Will continue with fresh optimizer. Error: {e}")
+
+            if optimizer_loaded and 'scheduler_state_dict' in checkpoint:
+                try:
+                    self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except Exception as e:
+                    if is_main_process():
+                        print(f"[Warning] Failed to load scheduler_state_dict. Will continue with fresh scheduler state. Error: {e}")
             
             start_epoch = checkpoint['epoch'] + 1
         
         else:
             if resume_path and is_main_process():
                 print(f"Warning: RESUME_PATH not found. Starting from scratch.")
-                self.load_pretrained_mask_encoder("/home/hyc/hyc_work/sceneGraph/SGG_pretrain/ckpt-epoch-300.pth")
+                self.load_pretrained_mask_encoder("/data0/jiangxiangwei/Diff-SGG/ckpt-epoch-300.pth")
             elif is_main_process():
                 print("No RESUME_PATH. Starting from scratch.")
 
@@ -298,6 +324,15 @@ class Pdiff4SSG_Pretraining_ddp():
         ''' Train '''
         self.model.train()
 
+        validate_at_start = bool(getattr(self.config, 'VALIDATE_AT_START', False))
+        if validate_at_start:
+            if is_main_process():
+                print(f"\n[Epoch {self.raw_model.epoch}] Starting Validation (at start)...")
+                self.validation_for_cls(epoch=self.raw_model.epoch)
+                print(f"[Epoch {self.raw_model.epoch}] Validation Finished (at start).")
+            dist.barrier()
+            self.model.train()
+
         while(keep_training):
             # [DDP] 3. 关键：每个 epoch 开始前设置 sampler 的 epoch，保证 shuffle 的随机性
             train_sampler.set_epoch(self.raw_model.epoch)
@@ -327,6 +362,11 @@ class Pdiff4SSG_Pretraining_ddp():
                 
                 # TensorBoard Log (仅 Rank 0)
                 global_step = self.raw_model.epoch * self.total + batch_idx
+                
+                base_momentum = 0.99  # 通常自监督起点是 0.99 或 0.996，0.9 可能太低了，你可以自己定
+                final_momentum = 1.0
+                current_momentum = self.get_current_momentum(global_step, self.max_iteration, base_momentum, final_momentum)
+                
                 if is_main_process() and self.writer is not None:
                     self.writer.add_scalar('Train/Total_Loss', total_loss.item(), global_step)
                     self.writer.add_scalar('Train/Diff_Loss', diff_loss.item(), global_step)
@@ -337,12 +377,11 @@ class Pdiff4SSG_Pretraining_ddp():
                 
                 # SwAV Monitor (尽量只在 Rank 0 计算，或者多卡计算后只在 Rank 0 更新)
                 with torch.no_grad():
-                     # 注意：如果是 DDP 模型，访问子模块需要 .module
-                     # 这里 self.model 是 DDP，访问 swav_reg_edge 需通过 self.model.module
-                    z1, q1 = self.model.module.swav_reg_edge.forward_test(gcn_edge_feature_3d)
-                
+                    z1 = torch.nn.functional.normalize(gcn_edge_feature_3d, dim=1, p=2)
+                    mcr_stats = getattr(self.model.module, '_last_edge_mcr_stats', None)
+
                 if is_main_process():
-                    self.swav_monitor.update(embeddings=z1, swav_q=q1)
+                    self.swav_monitor.update(embeddings=z1, swav_q=None, mcr_stats=mcr_stats)
                 
                 current_lr = self.optimizer.param_groups[1]['lr']
 
@@ -357,7 +396,7 @@ class Pdiff4SSG_Pretraining_ddp():
                         'lr': f'{current_lr:.6f}'
                     })
                 
-                self.backward(total_loss)
+                self.backward(total_loss,current_momentum)
             
             # ==========================================
             # [新增/修改] 模型保存与验证逻辑
@@ -382,7 +421,9 @@ class Pdiff4SSG_Pretraining_ddp():
             # 2. 执行验证 (仅 Rank 0，每 10 epoch 且 > 0)
             # 注意：在 DDP 中，如果只让 Rank 0 做耗时操作，其他进程可能会超时。
             # 建议加上 barrier 确保同步，或者确保验证时间在 nccl timeout 范围内。
-            if current_epoch > 0 and current_epoch % 10 == 0:
+            validate_every_n_epoch = bool(getattr(self.config, 'VALIDATE_EVERY_N_EPOCH', True))
+            valid_interval = int(getattr(self.config, 'VALID_INTERVAL', 10))
+            if validate_every_n_epoch and valid_interval > 0 and current_epoch > 0 and current_epoch % valid_interval == 0:
                 if is_main_process():
                     print(f"\n[Epoch {current_epoch}] Starting Validation...")
                     self.validation_for_cls(epoch=current_epoch)
@@ -406,10 +447,25 @@ class Pdiff4SSG_Pretraining_ddp():
         # [DDP] 移动到 self.device (根据 rank 确定的 device)
         return [item.to(self.device, non_blocking=True) for item in args]
 
-    def backward(self, loss):
+    def get_current_momentum(self, current_step, max_steps, base_tau=0.99, final_tau=1.0):
+        # 简单的线性增长
+        return base_tau + (final_tau - base_tau) * (current_step / max_steps)
+    
+    def backward(self, loss, current_momentum):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
         self.optimizer.step()
+        # =========================================================
+        # [修改] 核心修正点
+        # =========================================================
+        # 检查 self.model 是否被 DDP 包装过
+        if hasattr(self.model, 'module'):
+            # 如果是 DDP，访问 .module 来调用自定义方法
+            self.model.module._update_target(momentum=current_momentum)
+        else:
+            # 如果是单卡或者没用 DDP，直接调用
+            self.model._update_target(momentum=current_momentum)
+        # =========================================================
         self.optimizer.zero_grad()
         self.lr_scheduler.step()
         
@@ -426,7 +482,7 @@ class Pdiff4SSG_Pretraining_ddp():
         
         # 1. 创建验证集 DataLoader
         # 注意：验证集不需要 DistributedSampler，因为只在 Rank 0 跑
-        val_dataset = build_dataset_for_clustering() # 确保这里构建的是验证集/全集
+        val_dataset = build_dataset_for_clustering(self.config) # 确保这里构建的是验证集/全集
         val_loader = CustomDataLoader(
             config = self.config,
             dataset=val_dataset,

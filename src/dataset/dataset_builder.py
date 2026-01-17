@@ -25,7 +25,15 @@ def build_dataset(split,
     )
     return dataset
 
-def build_dataset_for_clustering():
+def build_dataset_for_clustering(config=None):
+
+    root = None
+    root_3rscan = None
+    if config is not None and hasattr(config, 'dataset'):
+        if hasattr(config.dataset, 'root'):
+            root = config.dataset.root
+        if hasattr(config.dataset, 'root_3rscan'):
+            root_3rscan = config.dataset.root_3rscan
 
     dataset = SSGDatasetGraph(
         split='validation_scans', # 'train_scans'
@@ -35,7 +43,9 @@ def build_dataset_for_clustering():
         use_normal=False, # False
         label_type='3RScan160',
         for_train= True,
-        max_edges = -1 # -1
+        max_edges = -1, # -1
+        root=root,
+        root_3rscan=root_3rscan,
     )
     return dataset
 

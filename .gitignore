@@ -2,12 +2,21 @@
 feature_analysis/
 save_path/
 checkpoints/
+outputs/
+data/SGG_dataset/
+data/ScanNet_merged_v2/
+data/ScanNet_merged_v2_20k_uniform_copy/
+data/scannet++_segments_export/
+data/scannet_segments_export/
 
 # 忽略特定类型的文件
 *.pth
 *.tar.gz
 *.vscode
 *.pt
+*.log
+*.bak_*
+.DS_Store
 
 # Python 编译缓存
 __pycache__/

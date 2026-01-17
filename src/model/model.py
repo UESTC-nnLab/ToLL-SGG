@@ -62,9 +62,14 @@ class Pdiff4SSG_Pretraining():
         # os.makedirs(self.save_dir, exist_ok=True)
         ''' Build dataset ''' 
         if val_cls_mode:      
-            self.dataset_train = build_dataset_for_clustering()
+            self.dataset_train = build_dataset_for_clustering(self.config)
         else:
-            self.dataset_train = build_dataset("train_scannet", True)
+            self.dataset_train = build_dataset(
+                "train_scannet",
+                True,
+                root_ScanNet=self.config.root_ScanNet,
+                json_path=self.config.json_path,
+            )
         
         self.total = self.config.total = len(self.dataset_train) // self.config.Batch_Size
         self.max_iteration = self.config.max_iteration = int(float(self.config.MAX_EPOCHES)*len(self.dataset_train) // self.config.Batch_Size)
@@ -72,7 +77,11 @@ class Pdiff4SSG_Pretraining():
         
         # --- [新增] 初始化 TensorBoard Writer ---
         # 建议加上时间戳，防止每次运行覆盖之前的日志
-        log_dir = os.path.join("/home/hyc/hyc_work/sceneGraph/SGG_DIR/runs", "experiment_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        log_root = getattr(self.config, 'analysis_save_dir', None)
+        if log_root is None:
+            log_root = os.path.join(os.getcwd(), "outputs")
+        log_dir = os.path.join(log_root, "log_runs", "experiment_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(log_dir, exist_ok=True)
         self.writer = SummaryWriter(log_dir=log_dir)
         
         self.swav_monitor = EpochCollapseMonitor(80)
@@ -95,26 +104,14 @@ class Pdiff4SSG_Pretraining():
         param_groups.extend(get_param_groups(self.model.predictor_obj, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
         # 2. 特殊模块: SwAV Prototypes (完全不 decay)
         param_groups.append({
-            'params': self.model.swav_reg_edge.parameters(), 
-            'lr': float(config.LR), 
-            'weight_decay': 0.0, # 规范写法
-            'amsgrad': self.config.AMSGRAD
-        })
-        param_groups.append({
             'params': self.model.swav_reg_triplet.parameters(), 
-            'lr': float(config.LR), 
-            'weight_decay': 0.0, # 规范写法
-            'amsgrad': self.config.AMSGRAD
-        })
-        param_groups.append({
-            'params': self.model.swav_reg_obj.parameters(), 
             'lr': float(config.LR), 
             'weight_decay': 0.0, # 规范写法
             'amsgrad': self.config.AMSGRAD
         })
         
         # 3. 特殊模块: MMG (学习率减半)
-        param_groups.extend(get_param_groups(self.model.mmg, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
+        param_groups.extend(get_param_groups(self.model.mmg, float(config.LR)/2, self.config.W_DECAY, self.config.AMSGRAD))
 
         # 4. 特殊参数: Mask Token
         # Token 通常被视为 Weight，需要 decay
@@ -225,22 +222,33 @@ class Pdiff4SSG_Pretraining():
             
             # 确保 checkpoint 加载到正确的设备
             checkpoint = torch.load(resume_path, map_location=torch.device('cuda'))
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
             
-            # 1. 加载模型状态
-            self.model.load_state_dict(checkpoint['model_state_dict'])
+            try:
+                self.model.load_state_dict(state_dict, strict=True)
+                print("[Info] Loaded model_state_dict with strict=True.")
+            except Exception as e:
+                print(f"[Warning] strict=True load failed, will try strict=False. Error: {e}")
+                sd_no_module = {
+                    (k[len('module.'):] if k.startswith('module.') else k): v
+                    for k, v in state_dict.items()
+                }
+                incompatible = self.model.load_state_dict(sd_no_module, strict=False)
+                print(f"[Warning] Loaded model_state_dict with strict=False. Missing: {len(incompatible.missing_keys)}, Unexpected: {len(incompatible.unexpected_keys)}")
+
+            optimizer_loaded = False
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                optimizer_loaded = True
+            except Exception as e:
+                print(f"[Warning] Failed to load optimizer_state_dict (param_groups may have changed). Will continue with fresh optimizer. Error: {e}")
             
-            # 2. 加载优化器状态
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if optimizer_loaded and 'scheduler_state_dict' in checkpoint:
+                try:
+                    self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                except Exception as e:
+                    print(f"[Warning] Failed to load scheduler_state_dict. Will continue with fresh scheduler state. Error: {e}")
             
-            # 3. 加载 Scheduler 状态 (如果存在)
-            if 'scheduler_state_dict' in checkpoint:
-                self.lr_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                print("Successfully loaded LR scheduler state.")
-            else:
-                print("Warning: 'scheduler_state_dict' not found in checkpoint. LR scheduler will restart.")
-            
-            # 4. 设置起始 epoch
-            # 我们从保存的 epoch 的 *下一个* epoch 开始
             start_epoch = checkpoint['epoch'] + 1
             print(f"Resuming from epoch {start_epoch}. Last recorded loss: {checkpoint.get('loss', 'N/A')}")
         
@@ -269,6 +277,13 @@ class Pdiff4SSG_Pretraining():
 
         ''' Train '''
         self.model.train()
+
+        validate_at_start = bool(getattr(self.config, 'VALIDATE_AT_START', False))
+        if validate_at_start:
+            print(f"\n[Epoch {self.model.epoch}] Starting Validation (at start)...")
+            self.validation_for_cls(epoch=self.model.epoch)
+            print(f"[Epoch {self.model.epoch}] Validation Finished (at start).")
+            self.model.train()
 
         while(keep_training):
             
@@ -323,11 +338,12 @@ class Pdiff4SSG_Pretraining():
                     self.writer.add_scalar('Train/total_metric', total_metric, global_step)
                 
                 with torch.no_grad():
-                    z1,q1 = self.model.swav_reg_edge.forward_test(gcn_edge_feature_3d)
+                    z1 = torch.nn.functional.normalize(gcn_edge_feature_3d, dim=1, p=2)
+                    mcr_stats = getattr(self.model, '_last_edge_mcr_stats', None)
         
                 # 3. 更新统计 (每个 Batch)
                 # 只需要把其中一个 view (z1, q1) 传进去即可代表本 Batch 情况
-                self.swav_monitor.update(embeddings=z1, swav_q=q1)
+                self.swav_monitor.update(embeddings=z1, swav_q=None, mcr_stats=mcr_stats)
                 
                 current_lr = self.optimizer.param_groups[1]['lr']
 
@@ -368,6 +384,15 @@ class Pdiff4SSG_Pretraining():
                     print(f'\n[Epoch {self.model.epoch}] 警告: 未定义 self.save_dir, 跳过保存。')
             
             self.swav_monitor.report(epoch_idx=self.model.epoch)
+
+            validate_every_n_epoch = bool(getattr(self.config, 'VALIDATE_EVERY_N_EPOCH', True))
+            valid_interval = int(getattr(self.config, 'VALID_INTERVAL', 10))
+            if validate_every_n_epoch and valid_interval > 0 and self.model.epoch > 0 and self.model.epoch % valid_interval == 0:
+                print(f"\n[Epoch {self.model.epoch}] Starting Validation...")
+                self.validation_for_cls(epoch=self.model.epoch)
+                print(f"[Epoch {self.model.epoch}] Validation Finished.")
+                self.model.train()
+
             self.model.epoch += 1
             loader = iter(train_loader)
     
@@ -455,11 +480,13 @@ class Pdiff4SSG_Pretraining():
         loader = iter(train_loader)
 
         # self.load_pretrained_mask_encoder("/home/honsen/tartan/ckpt-epoch-300.pth")
-        if epoch is not None:
-            model_dicts = torch.load(f"/home/hyc/hyc_work/sceneGraph/SGG_DIR/save_path/model_epoch_{epoch}.pth")
-        else:
-            model_dicts = torch.load("/home/hyc/hyc_work/sceneGraph/SGG_DIR/save_path/model_epoch_80.pth")
-        self.model.load_state_dict(model_dicts['model_state_dict'])
+        # 离线评测场景：模型权重可能已由外部（例如 main.py --eval_only --eval_ckpt）加载
+        if not getattr(self, '_ckpt_loaded', False):
+            if epoch is not None:
+                model_dicts = torch.load(f"/home/hyc/hyc_work/sceneGraph/SGG_DIR/save_path/model_epoch_{epoch}.pth")
+            else:
+                model_dicts = torch.load("/home/hyc/hyc_work/sceneGraph/SGG_DIR/save_path/model_epoch_80.pth")
+            self.model.load_state_dict(model_dicts['model_state_dict'])
         
         # self.load_pretrained_mask_encoder("/home/hyc/hyc_work/sceneGraph/SGG_pretrain/ckpt-epoch-300.pth")
         
@@ -507,7 +534,7 @@ class Pdiff4SSG_Pretraining():
         
         # 4. 计算指标并画图
         # 确保目录存在
-        cm_save_dir = "/home/hyc/hyc_work/sceneGraph/SGG_DIR/cm_save1"
+        cm_save_dir = os.path.join(self.config.analysis_save_dir, "cm_save")
         if not os.path.exists(cm_save_dir):
             os.makedirs(cm_save_dir)
 
@@ -527,7 +554,7 @@ class Pdiff4SSG_Pretraining():
             metric_prefix="val_edge"
         )
         
-        vis_save_dir = "/home/hyc/hyc_work/sceneGraph/SGG_DIR/clustering_new1_ssg"
+        vis_save_dir = os.path.join(self.config.analysis_save_dir, "clustering_new1_ssg")
         if not os.path.exists(vis_save_dir):
             os.makedirs(vis_save_dir)
         # print("Edge Clustering Metrics:", metrics_edge)

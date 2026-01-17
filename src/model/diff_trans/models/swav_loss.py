@@ -103,6 +103,11 @@ class SwAVLoss(nn.Module):
         return z1, q1
     
     def forward_asymmetric(self, z_teacher, z_student):
+        '''
+        z_teacher → teach_prototypes(z_t) → Sinkhorn → q_t
+        z_student → stu_prototypes(z_s) → log_softmax
+        loss = - sum(q_t * logp)（cross entropy）
+        '''
         """
         [核心方法] 非对称损失计算
         逻辑：Student 预测 Teacher 的聚类分配
