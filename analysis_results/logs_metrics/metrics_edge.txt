@@ -1,0 +1,11 @@
+Epoch: 10 | val_edge/silhouette: -0.1649 | val_edge/nmi: 0.1748 | val_edge/ari: 0.0595 | val_edge/acc: 0.1761
+Epoch: 20 | val_edge/silhouette: -0.0897 | val_edge/nmi: 0.3061 | val_edge/ari: 0.1190 | val_edge/acc: 0.2093
+Epoch: 30 | val_edge/silhouette: -0.0931 | val_edge/nmi: 0.2965 | val_edge/ari: 0.0963 | val_edge/acc: 0.1932
+Epoch: 40 | val_edge/silhouette: -0.0829 | val_edge/nmi: 0.3198 | val_edge/ari: 0.1120 | val_edge/acc: 0.2216
+Epoch: 50 | val_edge/silhouette: -0.0760 | val_edge/nmi: 0.3343 | val_edge/ari: 0.1380 | val_edge/acc: 0.2692
+Epoch: 60 | val_edge/silhouette: -0.0721 | val_edge/nmi: 0.3272 | val_edge/ari: 0.1185 | val_edge/acc: 0.2364
+Epoch: 70 | val_edge/silhouette: -0.0658 | val_edge/nmi: 0.3281 | val_edge/ari: 0.1199 | val_edge/acc: 0.1987
+Epoch: 80 | val_edge/silhouette: -0.0803 | val_edge/nmi: 0.2919 | val_edge/ari: 0.1027 | val_edge/acc: 0.1982
+Epoch: 90 | val_edge/silhouette: -0.0722 | val_edge/nmi: 0.3157 | val_edge/ari: 0.1178 | val_edge/acc: 0.2057
+Epoch: 100 | val_edge/silhouette: -0.0742 | val_edge/nmi: 0.3271 | val_edge/ari: 0.1224 | val_edge/acc: 0.2089
+Epoch: 110 | val_edge/silhouette: -0.0625 | val_edge/nmi: 0.3249 | val_edge/ari: 0.1170 | val_edge/acc: 0.1951

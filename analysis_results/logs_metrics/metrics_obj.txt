@@ -1,0 +1,11 @@
+Epoch: 10 | val_obj/silhouette: -0.1851 | val_obj/nmi: 0.4394 | val_obj/ari: 0.0527 | val_obj/acc: 0.1265
+Epoch: 20 | val_obj/silhouette: -0.3440 | val_obj/nmi: 0.3496 | val_obj/ari: 0.0121 | val_obj/acc: 0.0934
+Epoch: 30 | val_obj/silhouette: -0.3183 | val_obj/nmi: 0.3526 | val_obj/ari: 0.0202 | val_obj/acc: 0.0959
+Epoch: 40 | val_obj/silhouette: -0.3993 | val_obj/nmi: 0.3342 | val_obj/ari: 0.0134 | val_obj/acc: 0.1010
+Epoch: 50 | val_obj/silhouette: -0.3818 | val_obj/nmi: 0.3643 | val_obj/ari: 0.0292 | val_obj/acc: 0.1053
+Epoch: 60 | val_obj/silhouette: -0.4747 | val_obj/nmi: 0.3262 | val_obj/ari: 0.0202 | val_obj/acc: 0.0995
+Epoch: 70 | val_obj/silhouette: -0.4021 | val_obj/nmi: 0.3292 | val_obj/ari: 0.0292 | val_obj/acc: 0.0970
+Epoch: 80 | val_obj/silhouette: -0.4168 | val_obj/nmi: 0.3354 | val_obj/ari: 0.0342 | val_obj/acc: 0.0953
+Epoch: 90 | val_obj/silhouette: -0.4644 | val_obj/nmi: 0.2931 | val_obj/ari: 0.0177 | val_obj/acc: 0.0842
+Epoch: 100 | val_obj/silhouette: -0.4338 | val_obj/nmi: 0.3068 | val_obj/ari: 0.0329 | val_obj/acc: 0.0891
+Epoch: 110 | val_obj/silhouette: -0.4268 | val_obj/nmi: 0.3291 | val_obj/ari: 0.0293 | val_obj/acc: 0.1006

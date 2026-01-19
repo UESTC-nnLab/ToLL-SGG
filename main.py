@@ -104,12 +104,6 @@ if __name__ == '__main__':
     
     pretrainer.train()
     
-    # epoch_list =[90, 100, 110, 120, 130, 140, 150]# [10, 20, 30, 40, 50, 60, 70, 80]#, 90, 100, 110, 120, 130, 
-    # for epoch in epoch_list:
-    #     pretrainer.validation_for_cls(epoch=epoch)
-
-
-    ################################################################################
     '''
     新建一个会话：
     tmux new -s diff

@@ -126,17 +126,6 @@ class PointDif(BaseModel):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
         # 说明除了点/组 token，还对边/关系也做 mask 编码（更像“结构化 mask”）
         self.edge_mask_token = MaskedEdgeEncoder(512)
-        # 输入是 512*3，说明它把 3 个实体拼起来
-        # （例如：subject-predicate-object 或者 三元组关系特征），映射到 600 个原型
-        self.prototypes_triplet = nn.Linear(512*3, 600, bias=False)
-        # 边/关系特征映射到 200 个原型
-        # 把特征投到 K=200 个原型上（相当于聚类中心）
-        self.prototypes_edge = nn.Linear(512, 200, bias=False)
-        # 物体/节点特征映射到 1000 个原型
-        self.prototypes_obj = nn.Linear(512, 1000, bias=False)
-        # SwAV 的核心是：
-        # 不用人工标签，把特征投到 K 个“原型中心”，
-        # 再用 Sinkhorn 求一个“均衡分配”的伪标签，逼不同视角的同一个样本分配一致
         
         # --- 2. Target Network (Teacher) ---
         # 深度拷贝 Online 网络
@@ -147,24 +136,22 @@ class PointDif(BaseModel):
         self.ca_net_target = copy.deepcopy(self.ca_net)
         self.mask_token_target = copy.deepcopy(self.mask_token)
         self.edge_mask_token_target = copy.deepcopy(self.edge_mask_token)
-        self.prototypes_triplet_target = copy.deepcopy(self.prototypes_triplet)
-        self.prototypes_edge_target = copy.deepcopy(self.prototypes_edge)
-        self.prototypes_obj_target = copy.deepcopy(self.prototypes_obj)
+     
 
         # 冻结 Teacher 参数
         for p in self.get_target_params():
             p.requires_grad = False
 
-        self.contrastive_loss_fn = TextSupervisedContrastiveLoss(temperature=0.07, num_negatives=1000)
-        self.swav_reg_triplet = SwAVLoss(self.prototypes_triplet, self.prototypes_triplet_target)
-        self.swav_reg_edge = SwAVLoss(self.prototypes_edge, self.prototypes_edge_target)   
-        self.swav_reg_obj = SwAVLoss(self.prototypes_obj, self.prototypes_obj_target)        
+        self.contrastive_loss_fn = TextSupervisedContrastiveLoss(temperature=0.07, num_negatives=1000)    
 
         self.mcr_edge_loss = MCRLoss(out_dim=512, reduce_cov=1)
         self._last_edge_mcr_stats = None
 
         self.mcr_obj_loss = MCRLoss(out_dim=512, reduce_cov=1)
         self._last_obj_mcr_stats = None
+        
+        self.mcr_trip_loss = MCRLoss(out_dim=512*3, reduce_cov=1) # Triplet dim is 512*3
+        self._last_trip_mcr_stats = None
         
         self.point_diffusion = CPDM(self.config)
         self.count = 0
@@ -198,10 +185,7 @@ class PointDif(BaseModel):
                 list(self.mlp_3d.parameters()) + 
                 list(self.ca_net.parameters()) +
                 [self.mask_token] + # 注意 Parameter 要放入 list
-                list(self.edge_mask_token.parameters()) +
-                list(self.prototypes_triplet.parameters()) +
-                list(self.prototypes_edge.parameters()) +
-                list(self.prototypes_obj.parameters())
+                list(self.edge_mask_token.parameters())
                )
 
     def get_target_params(self):    
@@ -214,10 +198,7 @@ class PointDif(BaseModel):
                 list(self.mlp_3d_target.parameters()) + 
                 list(self.ca_net_target.parameters()) +
                 [self.mask_token_target] +
-                list(self.edge_mask_token_target.parameters()) +
-                list(self.prototypes_triplet_target.parameters()) +
-                list(self.prototypes_edge_target.parameters()) +
-                list(self.prototypes_obj_target.parameters())
+                list(self.edge_mask_token_target.parameters()) 
                )
 
     @torch.no_grad()
@@ -516,19 +497,8 @@ class PointDif(BaseModel):
         # -------------------------------------------------------------
         loss_edg_cross1, stats_edg_1 = self.mcr_edge_loss([pred_edg_v1], [edg_feat_tea_v6])
         loss_edg_cross2, stats_edg_2 = self.mcr_edge_loss([pred_edg_v2], [edg_feat_tea_v5])
-
-        if mask_indices_v3 is not None and mask_indices_v3.any():
-            loss_edg_cross3, stats_edg_3 = self.mcr_edge_loss([pred_edg_v3[mask_indices_v3]], [edg_feat_tea_v6[mask_indices_v3]])
-        else:
-            loss_edg_cross3 = loss_edg_cross1.new_zeros(())
-            stats_edg_3 = None
-
-        if mask_indices_v4 is not None and mask_indices_v4.any():
-            loss_edg_cross4, stats_edg_4 = self.mcr_edge_loss([pred_edg_v4[mask_indices_v4]], [edg_feat_tea_v5[mask_indices_v4]])
-        else:
-            loss_edg_cross4 = loss_edg_cross1.new_zeros(())
-            stats_edg_4 = None
-
+        loss_edg_cross3, stats_edg_3 = self.mcr_edge_loss([pred_edg_v3], [edg_feat_tea_v6])
+        loss_edg_cross4, stats_edg_4 = self.mcr_edge_loss([pred_edg_v4], [edg_feat_tea_v5])
         edge_loss = (loss_edg_cross1 + loss_edg_cross2 + loss_edg_cross3 + loss_edg_cross4) / 4.0
 
         with torch.no_grad():
@@ -549,22 +519,46 @@ class PointDif(BaseModel):
         # -------------------------------------------------------------
         # 3. Triplet Loss
         # -------------------------------------------------------------
-        loss_trip_cross1 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v6, pred_trip_v1)
-        loss_trip_cross2 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v5, pred_trip_v2)
-        loss_trip_cross3 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v6, pred_trip_v3)
-        loss_trip_cross4 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v5, pred_trip_v4)
+        loss_trip_cross1, stats_trip_1 = self.mcr_trip_loss([pred_trip_v1], [triplet_tea_v6])
+        loss_trip_cross2, stats_trip_2 = self.mcr_trip_loss([pred_trip_v2], [triplet_tea_v5])
+        loss_trip_cross3, stats_trip_3 = self.mcr_trip_loss([pred_trip_v3], [triplet_tea_v6])
+        loss_trip_cross4, stats_trip_4 = self.mcr_trip_loss([pred_trip_v4], [triplet_tea_v5])
 
+        # Average the losses
         triplet_loss = (loss_trip_cross1 + loss_trip_cross2 + loss_trip_cross3 + loss_trip_cross4) / 4.0
+
+        # Collect Statistics for Logging
+        with torch.no_grad():
+            comp_vals = [stats_trip_1['comp_loss'], stats_trip_2['comp_loss']]
+            expa_vals = [stats_trip_1['expa_loss'], stats_trip_2['expa_loss']]
+            
+            if stats_trip_3 is not None:
+                comp_vals.append(stats_trip_3['comp_loss'])
+                expa_vals.append(stats_trip_3['expa_loss'])
+            
+            if stats_trip_4 is not None:
+                comp_vals.append(stats_trip_4['comp_loss'])
+                expa_vals.append(stats_trip_4['expa_loss'])
+                
+            self._last_trip_mcr_stats = {
+                'triplet_loss': triplet_loss.detach(),
+                'comp_loss': torch.stack(comp_vals).mean().detach(),
+                'expa_loss': torch.stack(expa_vals).mean().detach(),
+            }
+        
 
         # =====================================================================
         # [Step 6] 文本对比损失 (Optional)
         # =====================================================================
         contrastive_loss = 0.0
-        # if cur_obj_texts is not None and istrain:
-        #     # 假设这里是 CLIP 文本特征对齐
-        #     # 注意：这里应该使用 Student 的特征来对齐文本
-        #     contrastive_loss = self.contrastive_loss_fn(pred_obj_v1, cur_obj_texts) + \
-        #                        self.contrastive_loss_fn(pred_obj_v2, cur_obj_texts)
+        if cur_obj_texts is not None and istrain:
+            # 假设这里是 CLIP 文本特征对齐
+            # 注意：这里应该使用 Student 的特征来对齐文本
+            contrastive_loss = self.contrastive_loss_fn(pred_obj_v1, cur_obj_texts) + \
+                               self.contrastive_loss_fn(pred_obj_v2, cur_obj_texts)+ \
+                               self.contrastive_loss_fn(pred_obj_v3, cur_obj_texts)+ \
+                               self.contrastive_loss_fn(pred_obj_v4, cur_obj_texts)
+            contrastive_loss = contrastive_loss / 4.0
 
         # =====================================================================
         # [Step 7] 总损失聚合
@@ -572,11 +566,11 @@ class PointDif(BaseModel):
         total_loss = diff_loss + \
                      0.1 * obj_loss + \
                      0.1 * edge_loss + \
-                     0.2 * triplet_loss + \
+                     0.1 * triplet_loss + \
                      0.1 * contrastive_loss
         
         # 返回 v1 的特征供 visualization 或 logging 使用
-        return total_loss, diff_loss, triplet_loss, edge_loss, obj_loss, total_metric, edg_feat_tea_v6
+        return total_loss, diff_loss, triplet_loss, edge_loss, obj_loss, contrastive_loss, total_metric
 
     def forward_cls(self, pts, edge_indices, descriptor=None,\
                 batch_ids=None, istrain=False):

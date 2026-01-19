@@ -9,8 +9,8 @@ class TextSupervisedContrastiveLoss(nn.Module):
         self.temperature = temperature
         self.num_negatives = num_negatives # 指定随机采样的负样本数量
         self.cross_entropy = nn.CrossEntropyLoss()
-
-    def forward(self, point_features, batch_texts, text_embeddings_dict):
+        self.text_embeddings_dict = torch.load('/home/hyc/hyc_work/sceneGraph/SGG_DIR/scannet_text_embeddings.pt')
+    def forward(self, point_features, batch_texts):
         """
         参数:
             point_features: (B, Dim)
@@ -31,7 +31,7 @@ class TextSupervisedContrastiveLoss(nn.Module):
         
         # B. 找出所有可能的负样本 (字典总Key - 正样本Key)
         # 注意：这里转换成 set 进行差集运算
-        all_keys_set = set(text_embeddings_dict.keys())
+        all_keys_set = set(self.text_embeddings_dict.keys())
         positive_keys_set = set(positive_keys)
         candidate_negative_keys = list(all_keys_set - positive_keys_set)
         
@@ -49,7 +49,7 @@ class TextSupervisedContrastiveLoss(nn.Module):
         # ==========================================
         # 只提取 active_keys 对应的 embedding
         # 形状: (Num_Active_Keys, Dim)  <-- 远小于总类别数
-        text_embeddings_list = [text_embeddings_dict[k].to(device).view(-1) for k in active_keys]
+        text_embeddings_list = [self.text_embeddings_dict[k].to(device).view(-1) for k in active_keys]
         active_text_embeddings = torch.stack(text_embeddings_list)
         
         # ==========================================

@@ -116,9 +116,7 @@ class Pdiff4SSG_Pretraining_ddp():
                 os.makedirs(os.path.join(self.config.analysis_save_dir, "log_runs"))
             log_dir = os.path.join(self.config.analysis_save_dir, "log_runs", "experiment_" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
             self.writer = SummaryWriter(log_dir=log_dir)
-        
-        self.swav_monitor = EpochCollapseMonitor(200)
-        
+                
         ''' Build Model '''
         # [DDP] 模型先移动到对应的 GPU
         self.model = PointDif(self.config).to(self.device)
@@ -128,8 +126,9 @@ class Pdiff4SSG_Pretraining_ddp():
 
         # [DDP] 配置优化器 (在 DDP 包装之前配置参数组，这样 param 名称不会带 module. 前缀，保持原逻辑)
         param_groups = []
+        self.model.mask_encoder.requires_grad_(False)
         # 1. 常规模块
-        param_groups.extend(get_param_groups(self.model.mask_encoder, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
+        # param_groups.extend(get_param_groups(self.model.mask_encoder, float(config.LR)/5, self.config.W_DECAY, self.config.AMSGRAD))
         param_groups.extend(get_param_groups(self.model.rel_encoder_3d, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
         param_groups.extend(get_param_groups(self.model.ca_net, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
         param_groups.extend(get_param_groups(self.model.mlp_3d, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
@@ -137,9 +136,6 @@ class Pdiff4SSG_Pretraining_ddp():
         param_groups.extend(get_param_groups(self.model.predictor_triplet, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
         param_groups.extend(get_param_groups(self.model.predictor_edge, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
         param_groups.extend(get_param_groups(self.model.predictor_obj, float(config.LR), self.config.W_DECAY, self.config.AMSGRAD))
-        
-        # 2. 特殊模块: SwAV Prototypes
-        param_groups.append({'params': self.model.swav_reg_triplet.parameters(), 'lr': float(config.LR), 'weight_decay': 0.0, 'amsgrad': self.config.AMSGRAD})
         
         # 3. 特殊模块: MMG
         param_groups.extend(get_param_groups(self.model.mmg, float(config.LR)/2, self.config.W_DECAY, self.config.AMSGRAD))
@@ -291,31 +287,12 @@ class Pdiff4SSG_Pretraining_ddp():
         else:
             if resume_path and is_main_process():
                 print(f"Warning: RESUME_PATH not found. Starting from scratch.")
-                self.load_pretrained_mask_encoder("/data0/jiangxiangwei/Diff-SGG/ckpt-epoch-300.pth")
+                self.load_pretrained_mask_encoder("/home/hyc/hyc_work/sceneGraph/SGG_pretrain/ckpt-epoch-300.pth")
             elif is_main_process():
                 print("No RESUME_PATH. Starting from scratch.")
 
         # [DDP] epoch 记录在 raw_model 上
         self.raw_model.epoch = start_epoch
-        
-        # # =======================================================
-        # # 【新增代码】手动“快进” Scheduler 到当前进度
-        # # =======================================================
-        # if start_epoch > 0:
-        #     # 1. 计算当前已经跑过的总步数 (Total Steps)
-        #     # start_epoch 是当前的 Epoch 数 (比如 100)
-        #     # self.total 是每个 Epoch 的步数 (len(dataloader))
-        #     current_steps = start_epoch * self.total
-            
-        #     # 2. 告诉 Scheduler 我们在哪里
-        #     # PyTorch 的 Scheduler 都有一个 .last_epoch 属性，代表上一次更新的步数
-        #     # 设为 current_steps - 1，这样下一次 step() 就会变成 current_steps
-        #     self.lr_scheduler.last_epoch = current_steps - 1
-            
-        #     # 3. 强制刷新一下 Optimizer 里的学习率
-        #     # 这一步非常重要！否则 Optimizer 里的 lr 还是初始值
-        #     # 也就是执行一次“空”的 step，把正确的 lr 写入 optimizer
-        #     self.lr_scheduler.step()
         
         if self.total == 0:
             if is_main_process(): print('No training data provided!')
@@ -324,20 +301,10 @@ class Pdiff4SSG_Pretraining_ddp():
         ''' Train '''
         self.model.train()
 
-        validate_at_start = bool(getattr(self.config, 'VALIDATE_AT_START', False))
-        if validate_at_start:
-            if is_main_process():
-                print(f"\n[Epoch {self.raw_model.epoch}] Starting Validation (at start)...")
-                self.validation_for_cls(epoch=self.raw_model.epoch)
-                print(f"[Epoch {self.raw_model.epoch}] Validation Finished (at start).")
-            dist.barrier()
-            self.model.train()
 
         while(keep_training):
             # [DDP] 3. 关键：每个 epoch 开始前设置 sampler 的 epoch，保证 shuffle 的随机性
             train_sampler.set_epoch(self.raw_model.epoch)
-            
-            self.swav_monitor.reset()
             
             if self.raw_model.epoch > self.config.MAX_EPOCHES:
                 break
@@ -354,7 +321,7 @@ class Pdiff4SSG_Pretraining_ddp():
                 
                 ''' forward '''
                 # DDP forward
-                total_loss, diff_loss, triplet_loss, edge_loss, contrastive_loss, total_metric, gcn_edge_feature_3d = self.model(
+                total_loss, diff_loss, triplet_loss, edge_loss, obj_loss, contrastive_loss, total_metric = self.model(
                     obj_points.permute(0,2,1).contiguous(), edge_indices, obj_points_spatial, pts_v2=obj_points_view2,
                     descriptor=descriptor, descriptor_v2=descriptor_view2, batch_ids=batch_ids, anchor_id=anchor_ids, 
                     istrain=True, cur_obj_texts=cur_obj_texts
@@ -372,16 +339,9 @@ class Pdiff4SSG_Pretraining_ddp():
                     self.writer.add_scalar('Train/Diff_Loss', diff_loss.item(), global_step)
                     self.writer.add_scalar('Train/Triplet_Loss', triplet_loss.item(), global_step)
                     self.writer.add_scalar('Train/Edge_Loss', edge_loss.item(), global_step)
-                    self.writer.add_scalar('Train/Obj_Loss', contrastive_loss.item(), global_step)
+                    self.writer.add_scalar('Train/Obj_Loss', obj_loss.item(), global_step)
+                    self.writer.add_scalar('Train/ctr_loss', contrastive_loss.item(), global_step)
                     self.writer.add_scalar('Train/total_metric', total_metric, global_step)
-                
-                # SwAV Monitor (尽量只在 Rank 0 计算，或者多卡计算后只在 Rank 0 更新)
-                with torch.no_grad():
-                    z1 = torch.nn.functional.normalize(gcn_edge_feature_3d, dim=1, p=2)
-                    mcr_stats = getattr(self.model.module, '_last_edge_mcr_stats', None)
-
-                if is_main_process():
-                    self.swav_monitor.update(embeddings=z1, swav_q=None, mcr_stats=mcr_stats)
                 
                 current_lr = self.optimizer.param_groups[1]['lr']
 
@@ -391,7 +351,8 @@ class Pdiff4SSG_Pretraining_ddp():
                         'dif': f'{diff_loss.item():.4f}',
                         'tri_ls': f'{triplet_loss.item():.4f}',
                         'rel_ls': f'{edge_loss.item():.4f}',
-                        'obj_ls': f'{contrastive_loss.item():.4f}',
+                        'obj_ls': f'{obj_loss.item():.4f}',
+                        'ctr_ls': f'{contrastive_loss.item():.4f}',
                         'met': f'{total_metric:.1f}',
                         'lr': f'{current_lr:.6f}'
                     })
@@ -435,8 +396,8 @@ class Pdiff4SSG_Pretraining_ddp():
             # 3. 恢复训练模式 (验证会切换到 eval，必须切回来)
             self.model.train()
             
-            if is_main_process():
-                self.swav_monitor.report(epoch_idx=self.raw_model.epoch)
+            # if is_main_process():
+            #     self.swav_monitor.report(epoch_idx=self.raw_model.epoch)
             
             self.raw_model.epoch += 1
             # 这里的 loader = iter(train_loader) 不需要手动重置，外层 while 循环配合 for loop 即可，
