@@ -2,6 +2,7 @@
 feature_analysis/
 save_path/
 checkpoints/
+analysis_results/
 
 # 忽略特定类型的文件
 *.pth
