@@ -1,0 +1,578 @@
+import os
+import torch
+import sys
+sys.path.append('/home/honsen/honsen/SceneGraph/SG_pretrain_diff')
+
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import DropPath, trunc_normal_
+import numpy as np
+from src.model.diff_trans.models.build import MODELS
+from src.model.diff_trans.utils.checkpoint import get_missing_parameters_message, get_unexpected_parameters_message
+from src.model.diff_trans.utils.logger import *
+from src.model.diff_trans.utils import misc
+from src.model.diff_trans.models.mask_encoder import Mask_Encoder, Group, Encoder, TransformerEncoder
+from src.model.diff_trans.models.generator import CPDM, CANet
+from src.model.model_utils.model_base import BaseModel
+import math
+from src.model.model_utils.network_MMRGR import MMG
+from src.model.model_utils.network_PointNet import (PointNetfeat)
+from src.utils import op_utils
+from src.dataset.dataset_diffPoint import visualize_scenes_plt, visualize_scenes_plt_with_points, visualize_scenes_batch, visualize_and_save_sequence
+
+from src.model.diff_trans.models.weight_focal_loss import compute_adaptive_weight, compute_local_complexity_weight
+from src.model.diff_trans.models.swav_loss import SwAVLoss
+from src.model.diff_trans.models.contrastive_loss import TextSupervisedContrastiveLoss
+import copy
+
+class MaskedEdgeEncoder(nn.Module):
+    def __init__(self, edge_dim):
+        super().__init__()
+        # 1. 定义一个全局共享的 Mask Token
+        # 形状是 [1, edge_dim]，表示这是一个通用的“未知边”特征
+        self.mask_token = nn.Parameter(torch.randn(1, edge_dim))
+        
+        # 初始化参数（可选，但推荐）
+        nn.init.normal_(self.mask_token, std=0.02)
+
+    def forward(self, num_edges):
+        """
+        Args:
+            num_edges: int, 当前Batch中总的边数量
+        Returns:
+            masked_edge_features: [E, D] 准备送入GNN的初始边特征
+        """
+        
+        # 2. 广播 (Broadcasting)
+        # 将 [1, D] 扩展为 [E, D]
+        # .expand 不会分配新内存，只是改变视图，非常高效
+        masked_edge_features = self.mask_token.expand(num_edges, -1)
+        
+        # 注意：这里返回的特征所有行都是完全一样的数值
+        # 差异化将在后续的 GNN Message Passing 中产生
+        return masked_edge_features
+
+@MODELS.register_module()
+class PointDif(BaseModel):
+    def __init__(self, config, dim_descriptor=11):
+        super().__init__('Diff_sg', config)
+        print_log(f'[Diff_sg] ', logger ='Diff_sg')
+        
+        self.mconfig = mconfig = config.sg_model
+        
+        with_bn = mconfig.WITH_BN
+
+        dim_point = 3
+        if mconfig.USE_RGB:
+            dim_point +=3
+        if mconfig.USE_NORMAL:
+            dim_point +=3
+
+        dim_f_spatial = dim_descriptor
+        dim_point_rel = dim_f_spatial
+
+        self.dim_point = dim_point
+        self.dim_edge = dim_point_rel
+        self.flow = 'target_to_source'
+
+        self.momentum = 0.996
+        self.model_pre = None
+
+        self.rel_encoder_3d = PointNetfeat(
+            global_feat=True,
+            batch_norm=with_bn,
+            point_size=11,
+            input_transform=False,
+            feature_transform=mconfig.feature_transform,
+            out_size=512)
+
+        self.mmg = MMG(
+            dim_node=512,
+            dim_edge=512,
+            dim_atten=256, #self.mconfig.DIM_ATTEN
+            depth=2, #self.mconfig.N_LAYERS
+            num_heads=8, #self.mconfig.NUM_HEADS
+            aggr="max", #self.mconfig.GCN_AGGR
+            flow=self.flow,
+            attention="fat",#self.mconfig.ATTENTION
+            use_edge=True,#self.mconfig.USE_GCN_EDGE
+            DROP_OUT_ATTEN=0.5)#self.mconfig.DROP_OUT_ATTEN
+        
+        self.config = config.maskTrans
+        self.group_size = self.config.group_size
+        self.num_group = self.config.num_group
+        self.trans_dim = self.config.encoder_config.trans_dim
+        self.mask_encoder = Mask_Encoder(self.config)
+        self.encoder_dims = self.config.encoder_config.encoder_dims
+        
+        self.mlp_3d = torch.nn.Sequential(
+            torch.nn.Linear(512, 512 - 11),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(0.3)
+        )
+        self.ca_net = CANet(self.encoder_dims, 512)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, self.trans_dim))
+        self.edge_mask_token = MaskedEdgeEncoder(512)
+        
+        self.prototypes_triplet = nn.Linear(512*3, 200, bias=False)
+        self.prototypes_edge = nn.Linear(512, 80, bias=False)
+        self.prototypes_obj = nn.Linear(512, 800, bias=False)
+
+        # --- 2. Target Network (Teacher) ---
+        # 深度拷贝 Online 网络
+        self.mask_encoder_target = copy.deepcopy(self.mask_encoder)
+        self.rel_encoder_3d_target = copy.deepcopy(self.rel_encoder_3d)
+        self.mmg_target = copy.deepcopy(self.mmg)
+        self.mlp_3d_target = copy.deepcopy(self.mlp_3d)
+        self.ca_net_target = copy.deepcopy(self.ca_net)
+        self.mask_token_target = copy.deepcopy(self.mask_token)
+        self.edge_mask_token_target = copy.deepcopy(self.edge_mask_token)
+        self.prototypes_triplet_target = copy.deepcopy(self.prototypes_triplet)
+        self.prototypes_edge_target = copy.deepcopy(self.prototypes_edge)
+        self.prototypes_obj_target = copy.deepcopy(self.prototypes_obj)
+
+        # 冻结 Teacher 参数
+        for p in self.get_target_params():
+            p.requires_grad = False
+
+        self.contrastive_loss_fn = TextSupervisedContrastiveLoss(temperature=0.07, num_negatives=1000)
+        self.swav_reg_triplet = SwAVLoss(self.prototypes_triplet, self.prototypes_triplet_target)
+        self.swav_reg_edge = SwAVLoss(self.prototypes_edge, self.prototypes_edge_target)   
+        self.swav_reg_obj = SwAVLoss(self.prototypes_obj, self.prototypes_obj_target)        
+        
+        self.point_diffusion = CPDM(self.config)
+        self.count = 0
+        
+        # 1.5 Predictors (Student Only! Teacher 不包含 Predictor)
+        # 用于防止 collapse，Student 输出需要通过 Predictor 才能去拟合 Teacher
+        self.predictor_triplet = nn.Sequential(
+            nn.Linear(512*3, 1024), nn.BatchNorm1d(1024), nn.ReLU(), nn.Linear(1024, 512*3))
+        
+        # [新增] Edge 和 Obj 的 Predictor
+        self.predictor_edge = nn.Sequential(
+            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Linear(512, 512))
+        self.predictor_obj = nn.Sequential(
+            nn.Linear(512, 512), nn.BatchNorm1d(512), nn.ReLU(), nn.Linear(512, 512))
+
+        print_log(f'[PointDif] divide point cloud into G{self.num_group} x S{self.group_size} points ...', logger ='PointDif')
+        self.group_divider = Group(num_group = self.num_group, group_size = self.group_size)
+
+        trunc_normal_(self.mask_token, std=.02)
+
+   # ==================== EMA Helpers (关键修改) ====================
+    def get_online_params(self):
+        """
+        返回所有需要 EMA 更新的 Student 参数列表。
+        必须与 get_target_params 的顺序严格一一对应。
+        注意：Predictor 不在这里，因为 Teacher 没有 Predictor。
+        """
+        return (list(self.mask_encoder.parameters()) + 
+                list(self.rel_encoder_3d.parameters()) + 
+                list(self.mmg.parameters()) +
+                list(self.mlp_3d.parameters()) + 
+                list(self.ca_net.parameters()) +
+                [self.mask_token] + # 注意 Parameter 要放入 list
+                list(self.edge_mask_token.parameters()) +
+                list(self.prototypes_triplet.parameters()) +
+                list(self.prototypes_edge.parameters()) +
+                list(self.prototypes_obj.parameters())
+               )
+
+    def get_target_params(self):    
+        """
+        返回 Teacher 对应的参数列表。
+        """
+        return (list(self.mask_encoder_target.parameters()) + 
+                list(self.rel_encoder_3d_target.parameters()) + 
+                list(self.mmg_target.parameters()) +
+                list(self.mlp_3d_target.parameters()) + 
+                list(self.ca_net_target.parameters()) +
+                [self.mask_token_target] +
+                list(self.edge_mask_token_target.parameters()) +
+                list(self.prototypes_triplet_target.parameters()) +
+                list(self.prototypes_edge_target.parameters()) +
+                list(self.prototypes_obj_target.parameters())
+               )
+
+    @torch.no_grad()
+    def _update_target(self, momentum):
+        self.momentum = momentum
+        for p_o, p_t in zip(self.get_online_params(), self.get_target_params()):
+            p_t.data = p_t.data * self.momentum + p_o.data * (1. - self.momentum)
+    
+
+    def obj_feat_extractor(self, pts, anchor_id, batch_ids, descriptor, mask_ratio=None, istarget=False, isview3 = False):
+         ##### 
+        # Point object features Extractors
+        # ###
+        
+        if anchor_id is not None:
+            anchor_set = 1
+        else:
+            anchor_set = 0
+        
+        B,_,_ = pts.shape        
+        # get patch
+        neighborhood, center = self.group_divider(pts)
+        
+        if istarget:
+            # mask and encoder
+            encoder_token, mask = self.mask_encoder_target(neighborhood, center, mask_ratio=mask_ratio)
+            _,N,_ = (center[mask].reshape(B,-1,3)).shape
+            # learnable masked token
+            mask_token = self.mask_token_target.expand(B, N, -1)
+            encoder_token[mask] = mask_token.reshape(-1, self.trans_dim)
+            point_agg_features = self.ca_net_target(encoder_token)
+        else:
+            encoder_token, mask = self.mask_encoder(neighborhood, center, mask_ratio=mask_ratio)
+            _,N,_ = (center[mask].reshape(B,-1,3)).shape
+            # learnable masked token
+            mask_token = self.mask_token.expand(B, N, -1)
+            encoder_token[mask] = mask_token.reshape(-1, self.trans_dim)
+            point_agg_features = self.ca_net(encoder_token)
+        
+        if isview3:
+            return point_agg_features
+        
+        if anchor_set:
+            device = point_agg_features.device
+
+            # 2. 将本地锚点索引列表 (Python list) 转换为 Tensor
+            #    例如: anchor_id = [1, 0, 2] (B=3, 第0个图的锚点是idx 1, ...)
+            local_anchor_ids_tensor = torch.tensor(anchor_id, device=device, dtype=torch.long)
+
+            # 3. 计算每个图的节点数
+            #    batch_ids (N_total, 1) -> (N_total)
+            batch_ids_squeezed = batch_ids.squeeze()
+            #    bincount 会统计 [0, 0, 0, 1, 1, 2, 2, 2] -> [3, 2, 3]
+            #    (即: 图0有3个节点, 图1有2个节点, 图2有3个节点)
+            counts = torch.bincount(batch_ids_squeezed)
+
+            # 4. 计算每个图的起始偏移量 (offsets)
+            #    counts [3, 2, 3] -> cumsum [3, 5, 8] -> shifted [0, 3, 5]
+            #    (即: 图0从idx 0开始, 图1从idx 3开始, 图2从idx 5开始)
+            offsets = torch.cat([torch.tensor([0], device=device), torch.cumsum(counts, dim=0)[:-1]])
+
+            # 5. 计算锚点的 *全局* 索引
+            #    offsets [0, 3, 5] + local_ids [1, 0, 2] = global_ids [1, 3, 7]
+            global_anchor_indices = offsets + local_anchor_ids_tensor
+            
+            # 6. 使用 *全局* 索引来提取和注入锚点特征
+            #    (旧代码: anchor_obj = point_agg_features[anchor_id:anchor_id+1])
+            anchor_obj_features = point_agg_features[global_anchor_indices]
+            
+            if istarget:
+                anchor_obj_features = self.mlp_3d_target(anchor_obj_features)
+            else:
+                anchor_obj_features = self.mlp_3d(anchor_obj_features)
+            
+            if self.mconfig.USE_SPATIAL:
+                tmp = descriptor.clone()
+                tmp[:,6:] = tmp[:,6:].log() # only log on volume and length
+
+                # (旧代码: tmp[anchor_id:anchor_id+1])
+                anchor_spatial_info = tmp[global_anchor_indices]
+                
+                # (旧代码: abs_obj = torch.cat([anchor_obj, ...]))
+                abs_obj_features = torch.cat([anchor_obj_features, anchor_spatial_info], dim=-1)
+                
+                # (旧代码: point_agg_features[anchor_id:anchor_id+1] = abs_obj.squeeze(0))
+                point_agg_features[global_anchor_indices] = abs_obj_features
+            
+            return point_agg_features, global_anchor_indices
+            # --- [!!! 锚点逻辑修改结束 !!!] ---
+        
+        else:
+            if istarget:
+                point_agg_features1 = self.mlp_3d_target(point_agg_features)
+            else:
+                point_agg_features1 = self.mlp_3d(point_agg_features)
+                
+            if self.mconfig.USE_SPATIAL:
+                tmp = descriptor.clone()
+                tmp[:,6:] = tmp[:,6:].log() # only log on volume and length
+                
+                point_agg_features1 = torch.cat([point_agg_features1, tmp], dim=-1)
+                return point_agg_features1
+    
+    def generate_object_pair_features(self, obj_feats, edges_feats, edge_indice):
+        obj_pair_feats = []
+        for (edge_feat, edge_index) in zip(edges_feats, edge_indice.t()):
+            obj_pair_feats.append(torch.cat([obj_feats[edge_index[0]], obj_feats[edge_index[1]], edge_feat], dim=-1))
+        obj_pair_feats = torch.vstack(obj_pair_feats)
+        return obj_pair_feats
+    
+    def edge_masking(self, rel_feature_3d_view, edge_mask_ratio=0.4, istarget=False):
+        # 2. 定义掩码比例 (建议放在 config 中，此处暂定 0.3)
+        
+        num_edges = rel_feature_3d_view.shape[0]
+        
+        # 3. 生成随机掩码 (True 表示该边被 Mask 掉)
+        # device 保持一致
+        mask_indices = torch.rand(num_edges, device=rel_feature_3d_view.device) < edge_mask_ratio
+        
+        # 4. 执行替换操作
+        # 如果存在需要掩码的边
+        if mask_indices.any():
+            # 获取 mask token [1, 512]
+            if istarget:
+                mask_token = self.edge_mask_token_target.mask_token
+            else:
+                mask_token = self.edge_mask_token.mask_token
+            
+            # 计算需要掩码的数量
+            num_masked = mask_indices.sum()
+            
+            # 将 mask_token 广播并覆盖原特征
+            # 注意：这里直接修改 rel_feature_3d_view 的部分行
+        rel_feature_3d_view[mask_indices] = mask_token.expand(num_masked, -1)
+        return rel_feature_3d_view, mask_indices
+    
+    def student_view_construct(self, pts, edge_indices, descriptor, batch_ids, edge_mask_ratio=0.3, obj_center=None, anchor_id=None, istrain=False):
+        with torch.no_grad():
+            edge_feature = op_utils.Gen_edge_descriptor()(descriptor, edge_indices)
+            
+        if anchor_id is not None:
+            point_agg_features, global_anchor_indices = self.obj_feat_extractor(pts, anchor_id, batch_ids, descriptor)
+        else:
+            point_agg_features = self.obj_feat_extractor(pts, None, batch_ids, descriptor)
+        
+        rel_feature_3d = self.rel_encoder_3d(edge_feature)
+        rel_feature_3d, mask_indices =self.edge_masking(rel_feature_3d, edge_mask_ratio=edge_mask_ratio)
+        
+        if anchor_id is not None:
+            gcn_obj_feature_3d, gcn_edge_feature_3d \
+                    = self.mmg(point_agg_features, rel_feature_3d, edge_indices, batch_ids, global_anchor_indices, obj_center=obj_center, istrain=istrain)
+            return gcn_obj_feature_3d, gcn_edge_feature_3d, mask_indices
+        else:
+            gcn_obj_feature_3d, gcn_edge_feature_3d \
+            = self.mmg.forward_no_anchor(point_agg_features, rel_feature_3d,\
+                                    edge_indices, batch_ids, obj_center=obj_center, istrain=istrain, GRU=True)
+            return gcn_obj_feature_3d, gcn_edge_feature_3d, mask_indices
+        
+    def teacher_view_construct(self, pts, edge_indices, descriptor, batch_ids,\
+        obj_center, mask_ratio = 0.2, edge_mask_ratio=0.2, istrain=False):
+        with torch.no_grad():
+            edge_feature = op_utils.Gen_edge_descriptor()(descriptor, edge_indices)
+        with torch.no_grad():
+            
+            point_agg_features_view2 = self.obj_feat_extractor(pts, None, batch_ids, descriptor, mask_ratio = mask_ratio, istarget=True)
+            rel_feature_3d_view2 = self.rel_encoder_3d_target(edge_feature)
+            
+            rel_feature_3d_view2, _ =self.edge_masking(rel_feature_3d_view2, edge_mask_ratio=edge_mask_ratio, istarget=True)
+            
+            gcn_obj_feature_3d_view2, gcn_edge_feature_3d_view2 \
+            = self.mmg_target.forward_no_anchor(point_agg_features_view2, rel_feature_3d_view2,\
+                                    edge_indices, batch_ids, obj_center, istrain=istrain)
+            
+        return gcn_obj_feature_3d_view2, gcn_edge_feature_3d_view2
+    
+    def forward(self, pts, edge_indices, obj_points_spatial, descriptor=None, pts_v2=None, \
+                descriptor_v2=None, batch_ids=None, anchor_id=[], istrain=False, cur_obj_texts=None):
+        
+        # 记录中心点 (用位置编码 for weight computation)
+        obj_center_v1 = descriptor[:, :3].clone()
+        obj_center_v2 = descriptor_v2[:, :3].clone()
+        
+        # =====================================================================
+        # [Step 1] 构建视图 (4 Students, 2 Teachers)
+        # =====================================================================
+        
+        # --- 1. Edge Guided Students (侧重边/锚点拓扑学习) ---
+        # Student v1 (Input: View 1)
+        obj_feat_stu_v1, edg_feat_stu_v1, _ = \
+            self.student_view_construct(pts, edge_indices, descriptor, \
+            batch_ids, anchor_id = anchor_id, edge_mask_ratio=0.2, istrain=istrain)
+        
+        # # Student v2 (Input: View 2)
+        # obj_feat_stu_v2, edg_feat_stu_v2, _ = \
+        #     self.student_view_construct(pts_v2, edge_indices, descriptor_v2, \
+        #     batch_ids, anchor_id = anchor_id, edge_mask_ratio=0.3, istrain=istrain)
+
+        # --- 2. Node Guided Students (侧重节点/特征掩码学习) ---
+        # Student v3 (Input: View 1) - 较大的 mask ratio
+        obj_feat_stu_v3, edg_feat_stu_v3, mask_indices_v3 = \
+            self.student_view_construct(pts, edge_indices, descriptor, \
+            batch_ids, edge_mask_ratio=0.6, istrain=istrain) # 修正: mask_ratio 需在函数内部支持
+        
+        # # Student v4 (Input: View 2) - [修正] 改为 student_view_construct
+        # obj_feat_stu_v4, edg_feat_stu_v4, mask_indices_v4 = \
+        #     self.student_view_construct(pts_v2, edge_indices, descriptor_v2, \
+        #     batch_ids, edge_mask_ratio=0.6, istrain=istrain)
+        
+        # --- 3. Teachers (EMA 更新或弱增强，提供稳定目标) ---
+        # Teacher v5 (Input: View 1)
+        with torch.no_grad(): # 确保教师不反传梯度 (虽然 EMA 网络本身detached，显式声明更安全)
+            obj_feat_stu_v5, edg_feat_stu_v5 = \
+                self.teacher_view_construct(pts, edge_indices, descriptor, \
+                batch_ids, obj_center_v1, mask_ratio=0.3, edge_mask_ratio=0.3, istrain=istrain)
+            
+            # Teacher v6 (Input: View 2)
+            obj_feat_tea_v6, edg_feat_tea_v6 = \
+                self.teacher_view_construct(pts_v2, edge_indices, descriptor_v2, \
+                batch_ids, obj_center_v2, mask_ratio=0.1, edge_mask_ratio=0.1, istrain=istrain)
+
+        # =====================================================================
+        # [Step 2] 扩散生成损失 (使用 Student v1 引导)
+        # =====================================================================
+        # 使用 spatial 坐标计算局部复杂度权重，重点关注复杂区域
+        weights = compute_local_complexity_weight(obj_points_spatial)
+        # 扩散模型恢复 obj_points_spatial，由 obj_feat_stu_v1 提供语义引导
+        diff_loss, total_metric = self.point_diffusion.get_loss(obj_points_spatial, obj_feat_stu_v1, weights)
+
+        # =====================================================================
+        # [Step 3] 生成三元组特征 (Triplets: Object-Edge-Object)
+        # =====================================================================
+        # 辅助函数：根据边索引聚合节点和边特征
+        def get_triplet(obj_feat, edge_feat):
+            return self.generate_object_pair_features(obj_feat, edge_feat, edge_indices.t())
+
+        # Students Triplets
+        triplet_stu_v1 = get_triplet(obj_feat_stu_v1, edg_feat_stu_v1)
+        # triplet_stu_v2 = get_triplet(obj_feat_stu_v2, edg_feat_stu_v2)
+        triplet_stu_v3 = get_triplet(obj_feat_stu_v3, edg_feat_stu_v3)
+        # triplet_stu_v4 = get_triplet(obj_feat_stu_v4, edg_feat_stu_v4)
+        triplet_stu_v5 = get_triplet(obj_feat_stu_v5, edg_feat_stu_v5)
+        # Teachers Triplets (No Grad)
+        with torch.no_grad():
+            
+            triplet_tea_v6 = get_triplet(obj_feat_tea_v6, edg_feat_tea_v6)
+
+        # =====================================================================
+        # [Step 4] 自蒸馏预测头 (Predictors)
+        # 只有学生需要通过 Predictor 来预测教师
+        # =====================================================================
+        
+        # --- Object Predictors ---
+        pred_obj_v1 = self.predictor_obj(obj_feat_stu_v1)
+        # pred_obj_v2 = self.predictor_obj(obj_feat_stu_v2)
+        pred_obj_v3 = self.predictor_obj(obj_feat_stu_v3)
+        # pred_obj_v4 = self.predictor_obj(obj_feat_stu_v4)
+        pred_obj_v5 = self.predictor_obj(obj_feat_stu_v5)
+        
+        # --- Edge Predictors ---
+        pred_edg_v1 = self.predictor_edge(edg_feat_stu_v1)
+        # pred_edg_v2 = self.predictor_edge(edg_feat_stu_v2)
+        pred_edg_v3 = self.predictor_edge(edg_feat_stu_v3)
+        # pred_edg_v4 = self.predictor_edge(edg_feat_stu_v4)
+        pred_edg_v5 = self.predictor_edge(edg_feat_stu_v5)
+
+        # --- Triplet Predictors ---
+        pred_trip_v1 = self.predictor_triplet(triplet_stu_v1)
+        # pred_trip_v2 = self.predictor_triplet(triplet_stu_v2)
+        pred_trip_v3 = self.predictor_triplet(triplet_stu_v3)
+        # pred_trip_v4 = self.predictor_triplet(triplet_stu_v4)
+        pred_trip_v5 = self.predictor_triplet(triplet_stu_v5)
+
+        # =====================================================================
+        # [Step 5] 计算非对称自蒸馏损失 (Asymmetric Loss)
+        # 核心逻辑：交叉视角 (View 1 学生 学习 View 2 教师，反之亦然)
+        # =====================================================================
+        
+        # -------------------------------------------------------------
+        # 1. Object Loss (SwAV / DINO Style)
+        # -------------------------------------------------------------
+        # v1(Stu, View1) <-> v6(Tea, View2)
+        loss_obj_cross1 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v6, pred_obj_v1)
+        # v2(Stu, View2) <-> v5(Tea, View1)
+        # loss_obj_cross2 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v6, pred_obj_v2)
+        # v3(Stu, View1_Masked) <-> v6(Tea, View2)
+        loss_obj_cross3 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v6, pred_obj_v3)
+        # v4(Stu, View2_Masked) <-> v5(Tea, View1)
+        # loss_obj_cross4 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v6, pred_obj_v4)
+        loss_obj_cross5 = self.swav_reg_obj.forward_asymmetric(obj_feat_tea_v6, pred_obj_v5)
+
+        obj_loss = (loss_obj_cross1 + loss_obj_cross3 + loss_obj_cross5) / 3.0
+
+        # -------------------------------------------------------------
+        # 2. Edge Loss
+        # -------------------------------------------------------------
+        loss_edg_cross1 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v6, pred_edg_v1)
+        # loss_edg_cross2 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v5, pred_edg_v2)
+        loss_edg_cross3 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v6[mask_indices_v3], pred_edg_v3[mask_indices_v3])
+        # loss_edg_cross4 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v5[mask_indices_v4], pred_edg_v4[mask_indices_v4])
+        loss_edg_cross5 = self.swav_reg_edge.forward_asymmetric(edg_feat_tea_v6, pred_edg_v5)
+
+        edge_loss = (loss_edg_cross1 + loss_edg_cross3 + loss_edg_cross5) / 3.0
+
+        # -------------------------------------------------------------
+        # 3. Triplet Loss
+        # -------------------------------------------------------------
+        loss_trip_cross1 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v6, pred_trip_v1)
+        # loss_trip_cross2 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v5, pred_trip_v2)
+        loss_trip_cross3 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v6, pred_trip_v3)
+        # loss_trip_cross4 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v5, pred_trip_v4)
+        loss_trip_cross5 = self.swav_reg_triplet.forward_asymmetric(triplet_tea_v6, pred_trip_v5)
+
+        triplet_loss = (loss_trip_cross1 + loss_trip_cross3 + loss_trip_cross5) / 3.0
+
+        # =====================================================================
+        # [Step 6] 文本对比损失 (Optional)
+        # =====================================================================
+        contrastive_loss = 0.0
+        # if cur_obj_texts is not None and istrain:
+        #     # 假设这里是 CLIP 文本特征对齐
+        #     # 注意：这里应该使用 Student 的特征来对齐文本
+        #     contrastive_loss = self.contrastive_loss_fn(pred_obj_v1, cur_obj_texts) + \
+        #                        self.contrastive_loss_fn(pred_obj_v2, cur_obj_texts)
+
+        # =====================================================================
+        # [Step 7] 总损失聚合
+        # =====================================================================
+        total_loss = diff_loss + \
+                     0.1 * obj_loss + \
+                     0.1 * edge_loss + \
+                     0.2 * triplet_loss + \
+                     0.1 * contrastive_loss
+        
+        # 返回 v1 的特征供 visualization 或 logging 使用
+        return total_loss, diff_loss, triplet_loss, edge_loss, obj_loss, total_metric, edg_feat_tea_v6
+
+    def forward_cls(self, pts, edge_indices, descriptor=None,\
+                batch_ids=None, istrain=False):
+        
+        point_agg_features = self.obj_feat_extractor(pts, None, batch_ids, descriptor, istarget=False, mask_ratio=0.0)
+        
+        ##### 
+        # Predicate features Extractors
+        # ###
+        with torch.no_grad():
+            edge_feature = op_utils.Gen_edge_descriptor()(descriptor, edge_indices)
+            
+        rel_feature_3d = self.rel_encoder_3d(edge_feature)
+
+        obj_center = descriptor[:, :3].clone()
+        
+        gcn_obj_feature_3d, gcn_edge_feature_3d \
+            = self.mmg.forward_no_anchor(point_agg_features, rel_feature_3d, edge_indices, batch_ids, obj_center, istrain=istrain)
+                       
+            
+        return gcn_edge_feature_3d, gcn_obj_feature_3d
+
+    def forward_ori(self, pts, edge_indices, obj_points_spatial, descriptor=None,\
+                batch_ids=None, anchor_id=[], istrain=False, cur_obj_texts=None):
+        
+        point_agg_features, global_anchor_indices = self.obj_feat_extractor(pts, anchor_id, batch_ids, descriptor, mask_ratio=0.1)
+    
+        with torch.no_grad():
+            edge_feature = op_utils.Gen_edge_descriptor()(descriptor, edge_indices)
+            
+        rel_feature_3d = self.rel_encoder_3d(edge_feature)
+      
+        obj_center = descriptor[:, :3].clone()
+        
+        gcn_obj_feature_3d, gcn_edge_feature_3d \
+            = self.mmg(point_agg_features, rel_feature_3d, edge_indices, batch_ids, global_anchor_indices, obj_center, istrain=istrain)
+
+       
+        point_agg_features_spatial_view1 = gcn_obj_feature_3d 
+      
+        # self.count += 1
+        # pred_points = self.point_diffusion.sample(1024, point_agg_features_spatial_view1, "cuda")
+        # # pred_points, collected_frames = self.point_diffusion.sampleN(1024, point_agg_features_spatial, "cuda", capture_range=(500,0),capture_num=20)
+        # diff_loss, total_x0_metric = self.point_diffusion.get_loss1(pts, point_agg_features_spatial_view1)
+            
+        # visualize_scenes_plt(pred_points, obj_points_spatial, output_filename=f'/home/hyc/hyc_work/sceneGraph/SGG_DIR/sample_dir/sample_{self.count}.png')
+        # visualize_scenes_batch(pred_points, obj_points_spatial, output_dir=f'/home/honsen/honsen/SceneGraph/SG_pretrain_diff/sample_dir/batch_sample_{self.count}')
+        # visualize_and_save_sequence(collected_frames, save_path=f'/home/honsen/honsen/SceneGraph/SG_pretrain_diff/sample_dir/sequence_sample_{self.count}')
+        return gcn_edge_feature_3d, gcn_obj_feature_3d

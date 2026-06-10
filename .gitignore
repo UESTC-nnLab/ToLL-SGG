@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.bak
+*.bak_*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+conda_env/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Training outputs
+outputs/
+analysis_results/
+runs/
+log_runs/
+wandb/
+tensorboard/
+save_path*/
+checkpoints/
+*.log
+
+# Large model/data artifacts
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.npy
+*.npz
+*.ply
+*.pcd
+
+# Raw datasets should be downloaded separately.
+data/scans/
+data/3RScan/
+data/ScanNet/
+data/scannet/
+data/atlasnet_*.pt
+data/*embeddings*.pt
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
