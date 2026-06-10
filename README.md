@@ -58,11 +58,9 @@ Replace the placeholders below with the final public links before release.
 
 | Name | Usage | Link |
 | --- | --- | --- |
-| Point-MAE / PointDif object encoder init | optional initialization for `MASK_ENCODER_INIT_PATH` | `<TODO: add public link>` |
-| ToLL++ ACTGR pretraining checkpoint | initialize downstream 3DSGG encoders | `<TODO: add public link>` |
-| ToLL SMA structural distillation checkpoint | initialize downstream 3DSGG encoders | `<TODO: add public link>` |
+| PointDif object encoder init | optional initialization for `MASK_ENCODER_INIT_PATH` | `<TODO: add public link>` |
+| ToLL pretraining checkpoint | initialize downstream 3DSGG encoders | `<TODO: add public link>` |
 | 3DSSG fine-tuned checkpoint | reproduce downstream results | `<TODO: add public link>` |
-| Precomputed text / Atlas embeddings | optional contrastive or alignment branches | `<TODO: add public link>` |
 
 ## Pretraining
 
