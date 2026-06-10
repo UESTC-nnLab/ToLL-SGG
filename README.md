@@ -7,10 +7,29 @@ This repository is organized around the two stages used in the paper:
 - `pretraining/`: topology-aware 3D scene graph pretraining, including the ACTGR/ToLL++ layout restoration branch and the SMA structural distillation branch.
 - `finetuning/`: downstream 3D scene graph generation modules and fine-tuning configuration.
 
+## Motivation
+
+<p align="center">
+  <img src="assets/motivation.png" alt="Motivation: geometric shortcut in 3D scene graph pretraining" width="95%">
+</p>
+
+Dense object-level layout priors can provide a shortcut for reconstructive 3D scene graph pretraining: the generative objective may be optimized through object shape, size, and absolute spatial priors while the edge/message branch receives weak learning signals. The gradient analysis above shows that edge-aware reasoning can be suppressed when the model bypasses topology, motivating ToLL to impose a single-anchor bottleneck and learn layout recovery through topological message passing.
+
+## Main Architecture
+
+<p align="center">
+  <img src="assets/architecture.png" alt="ToLL architecture overview" width="95%">
+</p>
+
+ToLL builds connected subgraphs from raw 3D scenes and trains the encoder with complementary structural views. The edge-guided student view performs Anchor-Conditioned Topological Geometric Reasoning (ACTGR), where a recurrent relational GNN propagates relative geometric messages from a single anchor and a conditional diffusion model restores the masked layout. The global teacher and node-guided student views form the Structural Multi-view Augmentation (SMA) branch, where prototype-based Sinkhorn assignments provide cross-view self-distillation. The final objective combines geometric layout recovery with structural distillation.
+
 ## Repository Layout
 
 ```text
 ToLL-SGG/
+  assets/
+    motivation.png
+    architecture.png
   pretraining/
     main_diff.py                 # ACTGR + ToLL++ layout restoration pretraining
     main_swav.py                 # SMA / SwAV-style structural distillation pretraining
